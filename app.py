@@ -55,101 +55,67 @@ DEFAULT_MAX_POSITION_VALUE_USD = 0.0  # 0 = no cap; cap on holdings_value = unit
 # --------------------------
 @st.cache_data(show_spinner=False)
 def fetch_ohlc(start: date, end: date) -> pd.DataFrame:
-    """Fetch daily OHLC for ETH-USD from Yahoo Finance, return a clean, single-index DF."""
-    df = yf.download(
-        "ETH-USD",
-        start=start,
-        end=end + timedelta(days=1),  # yfinance end is exclusive
-        interval="1d",
-        progress=False,
-        auto_adjust=False,
-    )
+    """Fetch daily OHLC for ETH-USD from Yahoo Finance with retries and a fallback loader."""
+    import time
+
+    # --- 1) Primary loader with a couple of retries ---
+    last_df = None
+    for _ in range(3):
+        try:
+            df = yf.download(
+                "ETH-USD",
+                start=start,
+                end=end + timedelta(days=1),  # yfinance end is exclusive
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+            )
+            last_df = df
+            if df is not None and not df.empty:
+                break
+        except Exception:
+            pass
+        time.sleep(1.2)  # brief backoff
+    else:
+        df = last_df
+
+    # --- 2) Fallback loader if empty: use .history(period='max') and slice ---
+    if df is None or len(df) == 0:
+        try:
+            tkr = yf.Ticker("ETH-USD")
+            df = tkr.history(period="max", interval="1d", auto_adjust=False)
+        except Exception:
+            df = None
+
     if df is None or len(df) == 0:
         return pd.DataFrame()
 
-    # If yfinance ever returns a column MultiIndex, flatten it
+    # --- 3) Normalize column names / shapes ---
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ['_'.join([c for c in col if c]) for col in df.columns]
 
-    # Keep only required columns; coerce to float
-    cols = {}
-    for col in ["High", "Low", "Close"]:
-        # try direct, then try flattened variants (e.g., "High_ETH-USD")
-        if col in df.columns:
-            s = df[col]
-        else:
-            # find the first column that endswith col
-            cand = [c for c in df.columns if c.split("_")[-1] == col]
-            s = df[cand[0]] if cand else pd.Series(index=df.index, dtype="float64")
-        cols[col] = pd.to_numeric(s, errors="coerce")
+    # Some variants name columns like 'High', 'High_ETH-USD', or 'ETH-USD High'
+    def pick_col(name):
+        if name in df.columns:
+            return df[name]
+        # try suffix/prefix matches
+        candidates = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
+        return df[candidates[0]] if candidates else pd.Series(index=df.index, dtype="float64")
 
-    out = pd.DataFrame(cols).dropna(how="any")
+    high = pd.to_numeric(pick_col("High"), errors="coerce")
+    low  = pd.to_numeric(pick_col("Low"), errors="coerce")
+    close = pd.to_numeric(pick_col("Close"), errors="coerce")
+
+    out = pd.DataFrame({"High": high, "Low": low, "Close": close}).dropna(how="any")
+
+    # --- 4) Clean index & slice to [start, end] ---
     out.index = pd.to_datetime(out.index).tz_localize(None)
-    out = out[(out.index.date >= start) & (out.index.date <= end)]
+    mask = (out.index.date >= start) & (out.index.date <= end)
+    out = out.loc[mask]
+
+    # Some very new days (depending on time of day) can be missing; that’s ok as long as we have data overall.
     return out
 
-
-def compute_indicators(ohlc: pd.DataFrame, rsi_period=14, atr_period=14):
-    """Return a DataFrame of strictly 1-D Series indicators aligned to the same index."""
-    if ohlc is None or ohlc.empty:
-        return pd.DataFrame()
-
-    # Ensure 1-D float Series with aligned index
-    idx = ohlc.index
-    def _to_series(x, name):
-        if isinstance(x, pd.DataFrame):
-            x = x.iloc[:, 0]
-        s = pd.Series(x, index=idx, name=name)
-        return pd.to_numeric(s, errors="coerce")
-
-    close = _to_series(ohlc.get("Close", np.nan), "Close")
-    high  = _to_series(ohlc.get("High",  np.nan), "High")
-    low   = _to_series(ohlc.get("Low",   np.nan), "Low")
-
-    # Rolling max for the dip window (use your configured default window)
-    roll_max = close.rolling(window=DEFAULT_WINDOW_DAYS, min_periods=1).max()
-
-    # Indicators (force to Series and numeric)
-    # Wilder RSI
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/float(rsi_period), adjust=False).mean()
-    roll_down = down.ewm(alpha=1/float(rsi_period), adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-
-    # Wilder ATR
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/float(atr_period), adjust=False).mean()
-
-    drawdown_pct = (roll_max - close) / roll_max * 100.0
-    sma50  = close.rolling(50).mean()
-    sma200 = close.rolling(200).mean()
-    atr_pct = (atr / close) * 100.0
-
-    # Build clean DataFrame
-    out = pd.DataFrame({
-        "Close": _to_series(close, "Close"),
-        "High": _to_series(high, "High"),
-        "Low": _to_series(low, "Low"),
-        "RollingMax": _to_series(roll_max, "RollingMax"),
-        "DrawdownPct": _to_series(drawdown_pct, "DrawdownPct"),
-        "SMA50": _to_series(sma50, "SMA50"),
-        "SMA200": _to_series(sma200, "SMA200"),
-        "RSI": _to_series(rsi, "RSI"),
-        "ATR": _to_series(atr, "ATR"),
-        "ATR_Pct": _to_series(atr_pct, "ATR_Pct"),
-    }).dropna(subset=["Close"])  # require at least Close to be present
-
-    # Align all columns strictly to the same index
-    out = out.loc[out.index.unique()].sort_index()
-    return out
 
 
 # --------------------------
