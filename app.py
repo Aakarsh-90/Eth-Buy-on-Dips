@@ -339,6 +339,38 @@ def compute_base_signals(ind: pd.DataFrame, threshold_mode: str, fixed_pct: floa
     cond = ind["DrawdownPct"] >= thr_series
     return cond & (~cond.shift(1).fillna(False))
 
+def robust_xirr(dates, amounts):
+    """Stable XIRR via bisection. Merges same-day cashflows, requires both signs."""
+    if len(dates) != len(amounts) or len(dates) == 0:
+        return np.nan
+    dfcf = pd.DataFrame({"date": pd.to_datetime(dates).date, "amt": amounts})
+    dfcf = dfcf.groupby("date", as_index=False)["amt"].sum().sort_values("date")
+    amts = dfcf["amt"].to_numpy(dtype=float)
+    dts  = pd.to_datetime(dfcf["date"])
+    if not (np.any(amts > 0) and np.any(amts < 0)):
+        return np.nan
+    t0 = dts.iloc[0]
+    years = (dts - t0).dt.days.to_numpy(dtype=float) / 365.0
+    def npv(r): return np.sum(amts / (1.0 + r) ** years)
+    lo, hi = -0.999, 10.0
+    f_lo, f_hi = npv(lo), npv(hi)
+    tries = 0
+    while f_lo * f_hi > 0 and hi < 1e6 and tries < 60:
+        hi *= 1.5; f_hi = npv(hi); tries += 1
+    if f_lo * f_hi > 0:
+        return np.nan
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        f_mid = npv(mid)
+        if abs(f_mid) < 1e-10:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return (lo + hi) / 2.0
+
+
 # --------------------------
 # Simulation (index-safe iteration)
 # --------------------------
@@ -498,10 +530,8 @@ def simulate_strategy(
     cashflows_dates.append(idx[-1].date())
     cashflows_amounts.append(terminal_value)
 
-    try:
-        irr = float(npf.xirr(cashflows_amounts, pd.to_datetime(cashflows_dates)))
-    except Exception:
-        irr = float("nan")
+    irr = robust_xirr(pd.to_datetime(cashflows_dates), cashflows_amounts)
+
 
     total_invested = float(-sum(a for a in cashflows_amounts if a < 0))
     summary = {
