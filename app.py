@@ -39,27 +39,25 @@ DEFAULT_RSI_MAX = 45.0            # only buy if RSI <= this
 DEFAULT_REQUIRE_NEW_HIGH_RESET = False
 DEFAULT_MAX_SIG_PER_MONTH = 0     # 0 = unlimited
 
-# NEW: Take-profit / rebalance
+# Take-profit / rebalance
 DEFAULT_TP_USE = False
 DEFAULT_TP_BASIS = "Average cost"     # "Average cost" or "Last buy price"
 DEFAULT_TP_TRIGGER_PCT = 20.0         # trigger when price >= basis * (1 + pct)
 DEFAULT_TP_SELL_PCT = 10.0            # sell % of current units on trigger
 DEFAULT_TP_COOLDOWN_DAYS = 7          # min days between TP sells
 
-# NEW: Allocation caps
+# Allocation caps
 DEFAULT_MAX_INVESTED_USD = 0.0        # 0 = no cap; cap applies to total invested (incl. starting & fees)
 DEFAULT_MAX_POSITION_VALUE_USD = 0.0  # 0 = no cap; cap on holdings_value = units * price
 
 # --------------------------
-# Data & indicators
+# Data loaders (Yahoo + CoinGecko)
 # --------------------------
 @st.cache_data(show_spinner=False)
-def fetch_ohlc(start: date, end: date) -> pd.DataFrame:
-    """Fetch daily OHLC for ETH-USD from Yahoo Finance with retries and a fallback loader."""
+def fetch_ohlc_yahoo(start: date, end: date) -> pd.DataFrame:
+    """Yahoo Finance loader with retries and column normalization."""
     import time
-
-    # --- 1) Primary loader with a couple of retries ---
-    last_df = None
+    df = None
     for _ in range(3):
         try:
             df = yf.download(
@@ -70,53 +68,146 @@ def fetch_ohlc(start: date, end: date) -> pd.DataFrame:
                 progress=False,
                 auto_adjust=False,
             )
-            last_df = df
             if df is not None and not df.empty:
                 break
         except Exception:
             pass
-        time.sleep(1.2)  # brief backoff
-    else:
-        df = last_df
-
-    # --- 2) Fallback loader if empty: use .history(period='max') and slice ---
-    if df is None or len(df) == 0:
-        try:
-            tkr = yf.Ticker("ETH-USD")
-            df = tkr.history(period="max", interval="1d", auto_adjust=False)
-        except Exception:
-            df = None
+        time.sleep(1.2)
 
     if df is None or len(df) == 0:
         return pd.DataFrame()
 
-    # --- 3) Normalize column names / shapes ---
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join([c for c in col if c]) for col in df.columns]
+        df.columns = ["_".join([c for c in col if c]) for col in df.columns]
 
-    # Some variants name columns like 'High', 'High_ETH-USD', or 'ETH-USD High'
     def pick_col(name):
         if name in df.columns:
             return df[name]
-        # try suffix/prefix matches
-        candidates = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
-        return df[candidates[0]] if candidates else pd.Series(index=df.index, dtype="float64")
+        cands = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
+        return df[cands[0]] if cands else pd.Series(index=df.index, dtype="float64")
 
-    high = pd.to_numeric(pick_col("High"), errors="coerce")
-    low  = pd.to_numeric(pick_col("Low"), errors="coerce")
+    high  = pd.to_numeric(pick_col("High"), errors="coerce")
+    low   = pd.to_numeric(pick_col("Low"), errors="coerce")
     close = pd.to_numeric(pick_col("Close"), errors="coerce")
 
     out = pd.DataFrame({"High": high, "Low": low, "Close": close}).dropna(how="any")
-
-    # --- 4) Clean index & slice to [start, end] ---
     out.index = pd.to_datetime(out.index).tz_localize(None)
     mask = (out.index.date >= start) & (out.index.date <= end)
-    out = out.loc[mask]
+    return out.loc[mask]
 
-    # Some very new days (depending on time of day) can be missing; that’s ok as long as we have data overall.
+
+@st.cache_data(show_spinner=False)
+def fetch_ohlc_coingecko(start: date, end: date) -> pd.DataFrame:
+    """
+    CoinGecko fallback using /market_chart?days=max (prices at many intraday points).
+    We resample to daily and build OHLC:
+      High = daily max, Low = daily min, Close = last price of the day.
+    """
+    import requests
+
+    url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart"
+    params = {"vs_currency": "usd", "days": "max"}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if "prices" not in data or len(data["prices"]) == 0:
+            return pd.DataFrame()
+        prices = pd.DataFrame(data["prices"], columns=["ts_ms", "price"])
+        prices["ts"] = pd.to_datetime(prices["ts_ms"], unit="ms", utc=True).dt.tz_convert(None)
+        prices = prices.set_index("ts").sort_index()
+
+        # Window slice
+        start_ts = pd.to_datetime(start) - pd.Timedelta(days=1)
+        end_ts = pd.to_datetime(end) + pd.Timedelta(days=1)
+        prices = prices.loc[(prices.index >= start_ts) & (prices.index <= end_ts)]
+
+        # Daily OHLC
+        daily = prices["price"].resample("D").agg(["first", "max", "min", "last"]).dropna(how="any")
+        daily.rename(columns={"max": "High", "min": "Low", "last": "Close"}, inplace=True)
+        out = daily[["High", "Low", "Close"]].copy()
+        out.index = pd.to_datetime(out.index)
+        out = out.loc[(out.index.date >= start) & (out.index.date <= end)]
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_ohlc(start: date, end: date, source: str = "Yahoo Finance") -> pd.DataFrame:
+    """Wrapper that uses selected source; if Yahoo empties, auto-fallback to CoinGecko."""
+    if source == "CoinGecko":
+        df = fetch_ohlc_coingecko(start, end)
+        if not df.empty:
+            return df
+        return fetch_ohlc_yahoo(start, end)
+    else:
+        df = fetch_ohlc_yahoo(start, end)
+        if not df.empty:
+            return df
+        return fetch_ohlc_coingecko(start, end)
+
+# --------------------------
+# Indicators & signal construction
+# --------------------------
+def compute_indicators(ohlc: pd.DataFrame, rsi_period=14, atr_period=14):
+    """Return a DataFrame of strictly 1-D Series indicators aligned to the same index."""
+    if ohlc is None or ohlc.empty:
+        return pd.DataFrame()
+
+    close = pd.to_numeric(ohlc["Close"], errors="coerce")
+    high  = pd.to_numeric(ohlc["High"], errors="coerce")
+    low   = pd.to_numeric(ohlc["Low"], errors="coerce")
+
+    roll_max = close.rolling(window=DEFAULT_WINDOW_DAYS, min_periods=1).max()
+
+    # Wilder RSI
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/float(rsi_period), adjust=False).mean()
+    roll_down = down.ewm(alpha=1/float(rsi_period), adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    # Wilder ATR
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/float(atr_period), adjust=False).mean()
+
+    drawdown_pct = (roll_max - close) / roll_max * 100.0
+    sma50  = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    atr_pct = (atr / close) * 100.0
+
+    out = pd.DataFrame({
+        "Close": close,
+        "High": high,
+        "Low": low,
+        "RollingMax": roll_max,
+        "DrawdownPct": drawdown_pct,
+        "SMA50": sma50,
+        "SMA200": sma200,
+        "RSI": rsi,
+        "ATR": atr,
+        "ATR_Pct": atr_pct,
+    }).dropna(subset=["Close"])
+
     return out
 
+def compute_base_signals(ind: pd.DataFrame, threshold_mode: str, fixed_pct: float, atr_mult: float) -> pd.Series:
+    """Return base 'crossed' signal (before filters) when drawdown crosses above threshold."""
+    if threshold_mode.startswith("ATR"):
+        thr_series = ind["ATR_Pct"] * atr_mult
+    else:
+        thr_series = pd.Series(fixed_pct, index=ind.index)
 
+    cond = ind["DrawdownPct"] >= thr_series
+    crossed = cond & (~cond.shift(1).fillna(False))
+    return crossed
 
 # --------------------------
 # Simulation (buys, sells, caps)
@@ -182,29 +273,23 @@ def simulate_strategy(
     for dt in idx:
         # --- Take-profit first (optional) ---
         if tp_use and current_units > 0:
-            # check TP cooldown
             can_tp = (last_tp_date is None) or ((dt.date() - last_tp_date).days >= int(tp_cooldown_days))
-
             if can_tp:
                 basis_price = avg_cost_per_unit() if tp_basis == "Average cost" else last_buy_price
                 if not pd.isna(basis_price):
                     trigger_price = basis_price * (1.0 + float(tp_trigger_pct) / 100.0)
                     if close.loc[dt] >= trigger_price:
-                        sell_units = current_units * (float(tp_sell_pct) / 100.0)
+                        sell_units = max(0.0, current_units * (float(tp_sell_pct) / 100.0))
                         if sell_units > 0:
                             exec_price = float(close.loc[dt]) * (1.0 - float(slippage_pct) / 100.0)
                             gross = sell_units * exec_price
                             fee = gross * (float(fee_pct) / 100.0)
                             net = gross - fee
 
-                            # update holdings & basis (average-cost method)
-                            # remove cost proportional to units sold
-                            nonlocal_total_cost = total_cost_excl_fees  # for mypy clarity
-                            cost_removed = avg_cost_per_unit() * sell_units if not pd.isna(avg_cost_per_unit()) else 0.0
+                            cost_removed = (avg_cost_per_unit() * sell_units) if not pd.isna(avg_cost_per_unit()) else 0.0
                             total_cost_excl_fees -= cost_removed
                             current_units -= sell_units
 
-                            # record cashflow (positive)
                             cashflows_dates.append(dt.date())
                             cashflows_amounts.append(net)
 
@@ -226,19 +311,13 @@ def simulate_strategy(
         # --- Buy logic (if base signal says 'consider buy') ---
         execute_buy = False
         if bool(base_signal.get(dt, False)):
-            # monthly cap
             ym = (dt.year, dt.month)
             if (max_signals_per_month > 0) and (month_counts.get(ym, 0) >= max_signals_per_month):
                 execute_buy = False
             else:
-                # buy cooldown
                 if (last_buy_date is None) or ((dt.date() - last_buy_date).days >= int(cooldown_days)):
-                    # new high reset
                     if require_new_high_reset and (last_signal_rollmax_at_buy is not None):
-                        if roll_max.loc[dt] > last_signal_rollmax_at_buy:
-                            execute_buy = True
-                        else:
-                            execute_buy = False
+                        execute_buy = bool(roll_max.loc[dt] > last_signal_rollmax_at_buy)
                     else:
                         execute_buy = True
 
@@ -256,13 +335,11 @@ def simulate_strategy(
 
         # Allocation caps (pre-trade checks)
         if execute_buy:
-            # cap by total invested (includes fees)
             total_invested_so_far = -sum(a for a in cashflows_amounts if a < 0)
             prospective_cash_out = float(buy_amount) * (1.0 + float(fee_pct) / 100.0)
             if (max_invested_usd > 0) and (total_invested_so_far + prospective_cash_out > float(max_invested_usd)):
                 execute_buy = False
 
-            # cap by position value
             position_value_now = current_units * float(close.loc[dt])
             if (max_position_value_usd > 0) and (position_value_now > float(max_position_value_usd)):
                 execute_buy = False
@@ -274,15 +351,14 @@ def simulate_strategy(
             fee_cash = float(buy_amount) * (float(fee_pct) / 100.0)
             total_cash_out = float(buy_amount) + fee_cash
 
-            # holdings & basis
             current_units += units_bought
             total_cost_excl_fees += float(buy_amount)  # fees excluded from basis
             last_buy_price = exec_price
             last_buy_date = dt.date()
             last_signal_rollmax_at_buy = roll_max.loc[dt]
+            ym = (dt.year, dt.month)
             month_counts[ym] = month_counts.get(ym, 0) + 1
 
-            # cash flow (negative)
             cashflows_dates.append(dt.date())
             cashflows_amounts.append(-total_cash_out)
 
@@ -345,7 +421,7 @@ def format_usd(x):
 # UI
 # --------------------------
 st.title("📉 ETH Buy-on-Dips — with Risk Controls")
-st.caption("Educational tool. Data: Yahoo Finance via yfinance. Not financial advice.")
+st.caption("Educational tool. Data: Yahoo Finance via yfinance (with CoinGecko fallback). Not financial advice.")
 
 with st.sidebar:
     st.header("Backtest Period")
@@ -361,6 +437,14 @@ with st.sidebar:
         st.info(f"Using today's date: {end_date.isoformat()}")
     else:
         end_date = st.date_input("Fixed end date", value=DEFAULT_FIXED_END_DATE, min_value=start_date)
+
+    # NEW: data source picker
+    data_source = st.selectbox(
+        "Data source",
+        ["Yahoo Finance", "CoinGecko"],
+        index=0,
+        help="Switch to CoinGecko if Yahoo returns no data."
+    )
 
     st.divider()
     st.header("Signal Logic")
@@ -426,9 +510,12 @@ with st.sidebar:
     )
 
 # Fetch & prep data
-ohlc = fetch_ohlc(start_date, end_date)
+ohlc = fetch_ohlc(start_date, end_date, source=data_source)
+# quick diagnostic so you can see what loaded
+st.write(f"Data source: {data_source} · rows: {len(ohlc)} · first: {ohlc.index.min() if len(ohlc) else None} · last: {ohlc.index.max() if len(ohlc) else None}")
+
 if ohlc.empty:
-    st.error("No price data returned for the selected dates.")
+    st.error("No price data returned for the selected dates (try CoinGecko source or Clear cache and rerun).")
     st.stop()
 
 ind = compute_indicators(ohlc, rsi_period=int(rsi_period), atr_period=int(atr_period))
@@ -472,7 +559,7 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Trades executed", f"{summary['n_trades']}")
 m2.metric("ETH held (final)", f"{summary['final_eth']:.6f}")
 m3.metric("Ending value", format_usd(summary["terminal_value"]))
-m4.metric("XIRR (annualized)" if pd.notna(summary["irr_xirr"]) else "XIRR (annualized)", 
+m4.metric("XIRR (annualized)" if pd.notna(summary["irr_xirr"]) else "XIRR (annualized)",
           f"{summary['irr_xirr']*100:.2f}%" if pd.notna(summary["irr_xirr"]) else "N/A")
 
 m5, m6 = st.columns(2)
@@ -543,5 +630,6 @@ st.markdown(
 - **Take-profit:** When price ≥ basis × (1 + TP%), sell % of holdings (with its own cooldown). Basis can be **Average cost** or **Last buy price**.
 - **Caps:** Skip buys if total invested (incl. starting & fees) would exceed cap, or if position value already exceeds cap.
 - **Performance:** XIRR from cash flows (starting outflow, all net buys/sells, terminal value inflow).
+- **Data source:** Yahoo Finance by default, with automatic CoinGecko fallback; you can also pick CoinGecko explicitly in the sidebar.
 """
 )
