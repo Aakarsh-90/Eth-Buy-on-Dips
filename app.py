@@ -29,11 +29,8 @@ DEFAULT_SLIPPAGE_PCT = 0.05      # % slippage on both buys & sells (buys: +, sel
 DEFAULT_COOLDOWN_DAYS = 0        # min days between buys
 
 # Improvement options
-DEFAULT_THRESHOLD_MODE = "Fixed % (classic 5%)"  # or "ATR multiple (vol-adaptive)"
 DEFAULT_ATR_PERIOD = 14
 DEFAULT_ATR_MULT = 2.0            # drawdown threshold = ATR% * MULT
-DEFAULT_TREND_FILTER = "None"     # "None", "Close > 200D SMA", "50D SMA > 200D SMA"
-DEFAULT_RSI_USE = False
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_RSI_MAX = 45.0            # only buy if RSI <= this
 DEFAULT_REQUIRE_NEW_HIGH_RESET = False
@@ -42,7 +39,7 @@ DEFAULT_MAX_SIG_PER_MONTH = 0     # 0 = unlimited
 # Take-profit / rebalance
 DEFAULT_TP_USE = False
 DEFAULT_TP_BASIS = "Average cost"     # "Average cost" or "Last buy price"
-DEFAULT_TP_TRIGGER_PCT = 20.0         # trigger when price >= basis * (1 + pct)
+DEFAULT_TP_TRIGGER_PCT = 20.0         # trigger when price ≥ basis × (1 + pct)
 DEFAULT_TP_SELL_PCT = 10.0            # sell % of current units on trigger
 DEFAULT_TP_COOLDOWN_DAYS = 7          # min days between TP sells
 
@@ -236,17 +233,6 @@ def simulate_strategy(
     max_invested_usd: float = 0.0,
     max_position_value_usd: float = 0.0
 ):
-    """
-    - Starting ETH units = start_value_usd / ref_price_usd; starting cost basis = start_value_usd.
-    - Buys use base_signal + filters; sells via take-profit rule.
-    - Fees/slippage on both sides:
-        * Buy executed_price = Close * (1 + slippage%), cash out = buy_amount + fee%*buy_amount.
-        * Sell executed_price = Close * (1 - slippage%), proceeds net of fee% on gross proceeds.
-    - Average-cost accounting for basis.
-    - Caps:
-        * max_invested_usd caps total negative cashflows (including starting value & fees).
-        * max_position_value_usd caps units*price — if exceeded, skip new buys.
-    """
     idx = ind.index
     close = ind["Close"]
     roll_max = ind["RollingMax"]
@@ -264,7 +250,6 @@ def simulate_strategy(
     cashflows_dates = [idx[0].date()]
     cashflows_amounts = [-float(start_value_usd)]
 
-    # Logs
     trades = []  # unified list of buys & sells
 
     def avg_cost_per_unit():
@@ -308,7 +293,7 @@ def simulate_strategy(
                             })
                             last_tp_date = dt.date()
 
-        # --- Buy logic (if base signal says 'consider buy') ---
+        # --- Buy logic ---
         execute_buy = False
         if bool(base_signal.get(dt, False)):
             ym = (dt.year, dt.month)
@@ -321,30 +306,26 @@ def simulate_strategy(
                     else:
                         execute_buy = True
 
-        # Trend filter
         if execute_buy and trend_filter == "Close > 200D SMA":
             execute_buy = bool(ind["Close"].loc[dt] > ind["SMA200"].loc[dt])
         elif execute_buy and trend_filter == "50D SMA > 200D SMA":
             execute_buy = bool(ind["SMA50"].loc[dt] > ind["SMA200"].loc[dt])
 
-        # RSI filter
         if execute_buy and use_rsi:
             rsi_val = ind["RSI"].loc[dt]
             if pd.isna(rsi_val) or not (rsi_val <= float(rsi_max)):
                 execute_buy = False
 
-        # Allocation caps (pre-trade checks)
         if execute_buy:
             total_invested_so_far = -sum(a for a in cashflows_amounts if a < 0)
             prospective_cash_out = float(buy_amount) * (1.0 + float(fee_pct) / 100.0)
             if (max_invested_usd > 0) and (total_invested_so_far + prospective_cash_out > float(max_invested_usd)):
                 execute_buy = False
 
-            position_value_now = current_units * float(close.loc[dt])
+            position_value_now = (current_units * float(close.loc[dt]))
             if (max_position_value_usd > 0) and (position_value_now > float(max_position_value_usd)):
                 execute_buy = False
 
-        # Execute BUY
         if execute_buy:
             exec_price = float(close.loc[dt]) * (1.0 + float(slippage_pct) / 100.0)
             units_bought = float(buy_amount) / exec_price
@@ -438,13 +419,16 @@ with st.sidebar:
     else:
         end_date = st.date_input("Fixed end date", value=DEFAULT_FIXED_END_DATE, min_value=start_date)
 
-    # NEW: data source picker
+    # Data source picker + cache clear
     data_source = st.selectbox(
         "Data source",
         ["Yahoo Finance", "CoinGecko"],
         index=0,
         help="Switch to CoinGecko if Yahoo returns no data."
     )
+    if st.button("🔄 Clear data cache"):
+        st.cache_data.clear()
+        st.rerun()
 
     st.divider()
     st.header("Signal Logic")
@@ -467,7 +451,7 @@ with st.sidebar:
     st.divider()
     st.header("Filters / Risk Controls")
     trend_filter = st.selectbox("Trend filter", ["None", "Close > 200D SMA", "50D SMA > 200D SMA"], index=0)
-    use_rsi = st.checkbox("Use RSI confirmation (buy only if RSI ≤ threshold)", value=DEFAULT_RSI_USE)
+    use_rsi = st.checkbox("Use RSI confirmation (buy only if RSI ≤ threshold)", value=False)
     rsi_period = st.number_input("RSI period", min_value=5, max_value=100, value=DEFAULT_RSI_PERIOD, step=1)
     rsi_max = st.number_input("RSI threshold (≤)", min_value=5.0, max_value=60.0, value=DEFAULT_RSI_MAX, step=1.0)
     require_new_high_reset = st.checkbox(
@@ -509,18 +493,33 @@ with st.sidebar:
         help="Initial ETH units = Starting value ÷ Reference price. Your instruction: $2,500 ÷ $354.31.",
     )
 
-# Fetch & prep data
-ohlc = fetch_ohlc(start_date, end_date, source=data_source)
-# quick diagnostic so you can see what loaded
-st.write(f"Data source: {data_source} · rows: {len(ohlc)} · first: {ohlc.index.min() if len(ohlc) else None} · last: {ohlc.index.max() if len(ohlc) else None}")
+# --------------------------
+# Fetch & prep data WITH FALLBACK
+# --------------------------
+primary = data_source
+secondary = "CoinGecko" if primary == "Yahoo Finance" else "Yahoo Finance"
+
+ohlc = fetch_ohlc(start_date, end_date, source=primary)
+if ohlc.empty:
+    st.warning(f"{primary} returned 0 rows; trying {secondary}…")
+    ohlc = fetch_ohlc(start_date, end_date, source=secondary)
+    used_source = secondary if not ohlc.empty else primary
+else:
+    used_source = primary
+
+st.write(
+    f"Using data source: {used_source} · rows: {len(ohlc)} · "
+    f"first: {ohlc.index.min() if len(ohlc) else None} · last: {ohlc.index.max() if len(ohlc) else None}"
+)
 
 if ohlc.empty:
-    st.error("No price data returned for the selected dates (try CoinGecko source or Clear cache and rerun).")
+    st.error("No price data returned from either source for the selected dates.")
     st.stop()
 
 ind = compute_indicators(ohlc, rsi_period=int(rsi_period), atr_period=int(atr_period))
 
 # Base dip signals
+threshold_mode = threshold_mode  # already defined in sidebar
 base_signal = compute_base_signals(
     ind,
     threshold_mode=threshold_mode,
