@@ -55,8 +55,8 @@ DEFAULT_MAX_POSITION_VALUE_USD = 0.0  # 0 = no cap; cap on holdings_value = unit
 # --------------------------
 @st.cache_data(show_spinner=False)
 def fetch_ohlc(start: date, end: date) -> pd.DataFrame:
-    """Fetch daily OHLC for ETH-USD from Yahoo Finance."""
-    data = yf.download(
+    """Fetch daily OHLC for ETH-USD from Yahoo Finance, return a clean, single-index DF."""
+    df = yf.download(
         "ETH-USD",
         start=start,
         end=end + timedelta(days=1),  # yfinance end is exclusive
@@ -64,70 +64,93 @@ def fetch_ohlc(start: date, end: date) -> pd.DataFrame:
         progress=False,
         auto_adjust=False,
     )
-    if data.empty:
+    if df is None or len(df) == 0:
         return pd.DataFrame()
-    df = data[["High", "Low", "Close"]].dropna().copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    df = df[(df.index.date >= start) & (df.index.date <= end)]
-    return df
 
-def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
+    # If yfinance ever returns a column MultiIndex, flatten it
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join([c for c in col if c]) for col in df.columns]
+
+    # Keep only required columns; coerce to float
+    cols = {}
+    for col in ["High", "Low", "Close"]:
+        # try direct, then try flattened variants (e.g., "High_ETH-USD")
+        if col in df.columns:
+            s = df[col]
+        else:
+            # find the first column that endswith col
+            cand = [c for c in df.columns if c.split("_")[-1] == col]
+            s = df[cand[0]] if cand else pd.Series(index=df.index, dtype="float64")
+        cols[col] = pd.to_numeric(s, errors="coerce")
+
+    out = pd.DataFrame(cols).dropna(how="any")
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    out = out[(out.index.date >= start) & (out.index.date <= end)]
+    return out
+
+
+def compute_indicators(ohlc: pd.DataFrame, rsi_period=14, atr_period=14):
+    """Return a DataFrame of strictly 1-D Series indicators aligned to the same index."""
+    if ohlc is None or ohlc.empty:
+        return pd.DataFrame()
+
+    # Ensure 1-D float Series with aligned index
+    idx = ohlc.index
+    def _to_series(x, name):
+        if isinstance(x, pd.DataFrame):
+            x = x.iloc[:, 0]
+        s = pd.Series(x, index=idx, name=name)
+        return pd.to_numeric(s, errors="coerce")
+
+    close = _to_series(ohlc.get("Close", np.nan), "Close")
+    high  = _to_series(ohlc.get("High",  np.nan), "High")
+    low   = _to_series(ohlc.get("Low",   np.nan), "Low")
+
+    # Rolling max for the dip window (use your configured default window)
+    roll_max = close.rolling(window=DEFAULT_WINDOW_DAYS, min_periods=1).max()
+
+    # Indicators (force to Series and numeric)
+    # Wilder RSI
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
+    roll_up = up.ewm(alpha=1/float(rsi_period), adjust=False).mean()
+    roll_down = down.ewm(alpha=1/float(rsi_period), adjust=False).mean()
     rs = roll_up / roll_down.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi
 
-def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    # Wilder ATR
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low).abs(),
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    return atr
+    atr = tr.ewm(alpha=1/float(atr_period), adjust=False).mean()
 
-def compute_indicators(ohlc: pd.DataFrame, rsi_period=14, atr_period=14):
-    close = ohlc["Close"]
-    high, low = ohlc["High"], ohlc["Low"]
-
-    roll_max = close.rolling(window=DEFAULT_WINDOW_DAYS, min_periods=1).max()
-    drawdown = (roll_max - close) / roll_max  # fraction
-
-    sma50 = close.rolling(50).mean()
+    drawdown_pct = (roll_max - close) / roll_max * 100.0
+    sma50  = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
-    rsi = rsi_wilder(close, rsi_period)
-    atr = atr_wilder(high, low, close, atr_period)
     atr_pct = (atr / close) * 100.0
 
+    # Build clean DataFrame
     out = pd.DataFrame({
-        "Close": close,
-        "High": high,
-        "Low": low,
-        "RollingMax": roll_max,
-        "DrawdownPct": drawdown * 100.0,
-        "SMA50": sma50,
-        "SMA200": sma200,
-        "RSI": rsi,
-        "ATR": atr,
-        "ATR_Pct": atr_pct
-    })
+        "Close": _to_series(close, "Close"),
+        "High": _to_series(high, "High"),
+        "Low": _to_series(low, "Low"),
+        "RollingMax": _to_series(roll_max, "RollingMax"),
+        "DrawdownPct": _to_series(drawdown_pct, "DrawdownPct"),
+        "SMA50": _to_series(sma50, "SMA50"),
+        "SMA200": _to_series(sma200, "SMA200"),
+        "RSI": _to_series(rsi, "RSI"),
+        "ATR": _to_series(atr, "ATR"),
+        "ATR_Pct": _to_series(atr_pct, "ATR_Pct"),
+    }).dropna(subset=["Close"])  # require at least Close to be present
+
+    # Align all columns strictly to the same index
+    out = out.loc[out.index.unique()].sort_index()
     return out
 
-def compute_base_signals(ind: pd.DataFrame, threshold_mode: str, fixed_pct: float, atr_mult: float) -> pd.Series:
-    """Return base 'crossed' signal (before filters) when drawdown crosses above threshold."""
-    if threshold_mode.startswith("ATR"):
-        thr_series = ind["ATR_Pct"] * atr_mult
-    else:
-        thr_series = pd.Series(fixed_pct, index=ind.index)
-
-    cond = ind["DrawdownPct"] >= thr_series
-    crossed = cond & (~cond.shift(1).fillna(False))
-    return crossed
 
 # --------------------------
 # Simulation (buys, sells, caps)
