@@ -70,9 +70,7 @@ def _finalize_ohlc(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
     df = df.loc[(df.index.date >= start) & (df.index.date <= end)]
-    # critical: drop any duplicate datetimes (some APIs return overlaps)
     df = df[~df.index.duplicated(keep="last")]
-    # keep only expected columns
     keep = [c for c in ["High", "Low", "Close"] if c in df.columns]
     df = df[keep].dropna(how="any")
     return df
@@ -105,7 +103,7 @@ def fetch_ohlc_yahoo(start: date, end: date) -> pd.DataFrame:
             return pd.DataFrame()
 
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ["_".join([c for c in col if c]) for col in df.columns]
+            df.columns = ["_".join([c for c in col if c]) for c in df.columns]
 
         def pick_col(name):
             if name in df.columns:
@@ -330,7 +328,6 @@ def compute_indicators(ohlc: pd.DataFrame, window_days: int, rsi_period: int, at
         "ATR": atr,
         "ATR_Pct": atr_pct,
     }).dropna(subset=["Close"])
-    # ensure unique index in case
     out = out[~out.index.duplicated(keep="last")]
     return out
 
@@ -372,7 +369,7 @@ def robust_xirr(dates, amounts):
 
 
 # --------------------------
-# Simulation (index-safe iteration)
+# Simulation (index-safe iteration) + Avg Cost Basis tracking
 # --------------------------
 def simulate_strategy(
     ind: pd.DataFrame,
@@ -423,7 +420,10 @@ def simulate_strategy(
     cashflows_dates = [idx[0].date()]
     cashflows_amounts = [-float(start_value_usd)]
     trades = []
+
+    # time series we track
     units_series = pd.Series(index=idx, dtype=float)
+    cost_basis_series = pd.Series(index=idx, dtype=float)
 
     def avg_cost_per_unit():
         return total_cost_excl_fees / current_units if current_units > 0 else np.nan
@@ -520,18 +520,22 @@ def simulate_strategy(
                 "SMA200": float(sma200[i]) if not pd.isna(sma200[i]) else np.nan,
             })
 
+        # record daily state
         units_series.iloc[i] = current_units
+        cost_basis_series.iloc[i] = (total_cost_excl_fees / current_units) if current_units > 0 else np.nan
 
+    # attach series
     ind = ind.copy()
     ind["Units"] = units_series
+    ind["AvgCostBasis"] = cost_basis_series
 
+    # terminal metrics
     portfolio_value = ind["Units"] * ind["Close"]
     terminal_value = float(portfolio_value.iloc[-1])
     cashflows_dates.append(idx[-1].date())
     cashflows_amounts.append(terminal_value)
 
     irr = robust_xirr(pd.to_datetime(cashflows_dates), cashflows_amounts)
-
 
     total_invested = float(-sum(a for a in cashflows_amounts if a < 0))
     summary = {
@@ -658,7 +662,7 @@ if ohlc.empty:
 # Indicators & signals (use sidebar values)
 ind = compute_indicators(
     ohlc,
-    window_days=int(st.session_state.get("window_days", 0) or  # in case reruns
+    window_days=int(st.session_state.get("window_days", 0) or
                     locals().get("window_days", DEFAULT_WINDOW_DAYS)),
     rsi_period=int(rsi_period),
     atr_period=int(DEFAULT_ATR_PERIOD),
@@ -705,6 +709,10 @@ m3.metric("Ending value", format_usd(summary["terminal_value"]))
 m4.metric("XIRR (annualized)" if pd.notna(summary["irr_xirr"]) else "XIRR (annualized)",
           f"{summary['irr_xirr']*100:.2f}%" if pd.notna(summary["irr_xirr"]) else "N/A")
 
+# New: show current Avg Cost Basis metric
+avg_basis_now = details["ind"]["AvgCostBasis"].iloc[-1] if "AvgCostBasis" in details["ind"].columns else np.nan
+st.metric("Avg cost (current)", format_usd(avg_basis_now) if pd.notna(avg_basis_now) else "—")
+
 m5, m6 = st.columns(2)
 m5.metric("Total invested (incl. fees & starting)", format_usd(summary["total_invested"]))
 m6.metric("P/L vs invested", f"{format_usd(summary['absolute_pnl'])} ({summary['pct_return_on_invested']:.2f}%)")
@@ -728,6 +736,17 @@ plt.title("ETH-USD (Close) — Buys (^) and Sells (v)")
 plt.xlabel("Date")
 plt.ylabel("Price (USD)")
 st.pyplot(fig1, use_container_width=True)
+
+# New: Average Cost Basis chart
+st.subheader("Average Cost Basis Over Time")
+fig_cb = plt.figure()
+plt.plot(details["ind"].index, details["ind"]["Close"], label="ETH Close")
+plt.plot(details["ind"].index, details["ind"]["AvgCostBasis"], label="Avg Cost Basis", linestyle="--")
+plt.legend()
+plt.title("Average Cost Basis vs Market Price")
+plt.xlabel("Date")
+plt.ylabel("Price (USD)")
+st.pyplot(fig_cb, use_container_width=True)
 
 st.subheader("Portfolio Value Over Time")
 fig2 = plt.figure()
