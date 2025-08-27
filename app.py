@@ -12,22 +12,22 @@ st.set_page_config(page_title="ETH Buy-the-Dip (5% in a Week)", layout="wide")
 # --------------------------
 # Defaults (your specs)
 # --------------------------
-DEFAULT_START_DATE = date(2020, 9, 27)   # your first buy date
+DEFAULT_START_DATE = date(2020, 9, 27)
 DEFAULT_FIXED_END_DATE = date(2025, 8, 27)
 
 # Core dip heuristic
-DEFAULT_THRESHOLD_PCT = 5.0      # classic 5% vs recent high
-DEFAULT_WINDOW_DAYS = 7          # "in the week"
-DEFAULT_BUY_AMOUNT = 150.0       # $150 per signal (pre-fees)
+DEFAULT_THRESHOLD_PCT = 5.0
+DEFAULT_WINDOW_DAYS = 7
+DEFAULT_BUY_AMOUNT = 150.0
 
 # Starting portfolio
-DEFAULT_START_VALUE = 2500.00    # your first purchase (USD)
-DEFAULT_REF_PRICE   = 354.31     # your first buy price per ETH
+DEFAULT_START_VALUE = 2500.00
+DEFAULT_REF_PRICE   = 354.31
 
 # Trading frictions
-DEFAULT_FEE_PCT = 0.10           # % fee on buys & sells (applied to cash amount)
-DEFAULT_SLIPPAGE_PCT = 0.05      # % slippage on buys & sells
-DEFAULT_COOLDOWN_DAYS = 0        # min days between buys
+DEFAULT_FEE_PCT = 0.10
+DEFAULT_SLIPPAGE_PCT = 0.05
+DEFAULT_COOLDOWN_DAYS = 0
 
 # Improvement options
 DEFAULT_ATR_PERIOD = 14
@@ -48,7 +48,7 @@ DEFAULT_TP_COOLDOWN_DAYS = 7
 DEFAULT_MAX_INVESTED_USD = 0.0
 DEFAULT_MAX_POSITION_VALUE_USD = 0.0
 
-# Keep last error for debug
+# Debug bucket
 if "last_loader_error" not in st.session_state:
     st.session_state.last_loader_error = ""
 
@@ -62,6 +62,20 @@ def _std_headers():
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+
+def _finalize_ohlc(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """Standardize index, sort, slice, and DROP DUPLICATES."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.sort_index()
+    df = df.loc[(df.index.date >= start) & (df.index.date <= end)]
+    # critical: drop any duplicate datetimes (some APIs return overlaps)
+    df = df[~df.index.duplicated(keep="last")]
+    # keep only expected columns
+    keep = [c for c in ["High", "Low", "Close"] if c in df.columns]
+    df = df[keep].dropna(how="any")
+    return df
 
 # --------------------------
 # Data loaders (Yahoo, CoinGecko, Binance, Coinbase, Kraken)
@@ -99,14 +113,12 @@ def fetch_ohlc_yahoo(start: date, end: date) -> pd.DataFrame:
             cands = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
             return df[cands[0]] if cands else pd.Series(index=df.index, dtype="float64")
 
-        high  = pd.to_numeric(pick_col("High"), errors="coerce")
-        low   = pd.to_numeric(pick_col("Low"), errors="coerce")
-        close = pd.to_numeric(pick_col("Close"), errors="coerce")
-
-        out = pd.DataFrame({"High": high, "Low": low, "Close": close}).dropna(how="any")
-        out.index = pd.to_datetime(out.index).tz_localize(None)
-        mask = (out.index.date >= start) & (out.index.date <= end)
-        return out.loc[mask]
+        out = pd.DataFrame({
+            "High": pd.to_numeric(pick_col("High"), errors="coerce"),
+            "Low":  pd.to_numeric(pick_col("Low"),  errors="coerce"),
+            "Close":pd.to_numeric(pick_col("Close"),errors="coerce"),
+        })
+        return _finalize_ohlc(out, start, end)
     except Exception as e:
         st.session_state.last_loader_error = f"Yahoo fatal: {e!s}"
         return pd.DataFrame()
@@ -129,15 +141,13 @@ def fetch_ohlc_coingecko(start: date, end: date) -> pd.DataFrame:
         prices = prices.set_index("ts").sort_index()
 
         start_ts = pd.to_datetime(start) - pd.Timedelta(days=1)
-        end_ts = pd.to_datetime(end) + pd.Timedelta(days=1)
+        end_ts   = pd.to_datetime(end)   + pd.Timedelta(days=1)
         prices = prices.loc[(prices.index >= start_ts) & (prices.index <= end_ts)]
 
         daily = prices["price"].resample("D").agg(["max", "min", "last"]).dropna(how="any")
         daily.rename(columns={"max": "High", "min": "Low", "last": "Close"}, inplace=True)
         out = daily[["High", "Low", "Close"]].copy()
-        out.index = pd.to_datetime(out.index)
-        out = out.loc[(out.index.date >= start) & (out.index.date <= end)]
-        return out
+        return _finalize_ohlc(out, start, end)
     except Exception as e:
         st.session_state.last_loader_error = f"CoinGecko error: {e!s}"
         return pd.DataFrame()
@@ -147,17 +157,11 @@ def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
     import requests, time
     try:
         start_ts = int(pd.Timestamp(start).timestamp() * 1000)
-        end_ts = int((pd.Timestamp(end) + pd.Timedelta(days=1)).timestamp() * 1000)
+        end_ts   = int((pd.Timestamp(end) + pd.Timedelta(days=1)).timestamp() * 1000)
         frames, cur = [], start_ts
         while cur < end_ts:
             url = "https://api.binance.com/api/v3/klines"
-            params = {
-                "symbol": "ETHUSDT",
-                "interval": "1d",
-                "startTime": cur,
-                "endTime": end_ts,
-                "limit": 1000
-            }
+            params = {"symbol":"ETHUSDT","interval":"1d","startTime":cur,"endTime":end_ts,"limit":1000}
             r = requests.get(url, params=params, timeout=30, headers=_std_headers())
             if r.status_code == 451:
                 st.session_state.last_loader_error = f"Binance HTTP {r.status_code}"
@@ -183,26 +187,23 @@ def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
             st.session_state.last_loader_error = "Binance returned no klines."
             return pd.DataFrame()
         out = pd.concat(frames).sort_index()
-        out = out.loc[(out.index.date >= start) & (out.index.date <= end)]
-        return out
+        return _finalize_ohlc(out, start, end)
     except Exception as e:
         st.session_state.last_loader_error = f"Binance error: {e!s}"
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
 def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
-    """Coinbase Exchange public API (no key). 1d candles, chunked requests."""
     import requests, time
     try:
         s = pd.Timestamp(start, tz="UTC")
         e = pd.Timestamp(end + timedelta(days=1), tz="UTC")
         step = pd.Timedelta(days=200)
-        frames = []
-        cur = s
+        frames, cur = [], s
         while cur < e:
             chunk_end = min(cur + step, e)
             url = "https://api.exchange.coinbase.com/products/ETH-USD/candles"
-            params = {"granularity": 86400, "start": cur.isoformat(), "end": chunk_end.isoformat()}
+            params = {"granularity":86400, "start":cur.isoformat(), "end":chunk_end.isoformat()}
             r = requests.get(url, params=params, timeout=30, headers=_std_headers())
             if r.status_code == 429:
                 time.sleep(1.0)
@@ -215,8 +216,7 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
             df = pd.DataFrame(data, columns=["time","low","high","open","close","volume"])
             df["ts"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
             df.set_index("ts", inplace=True)
-            df = df[["high","low","close"]].astype(float)
-            df.rename(columns={"high":"High","low":"Low","close":"Close"}, inplace=True)
+            df = df[["high","low","close"]].astype(float).rename(columns={"high":"High","low":"Low","close":"Close"})
             frames.append(df.sort_index())
             cur = chunk_end
             time.sleep(0.25)
@@ -224,15 +224,13 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
             st.session_state.last_loader_error = "Coinbase returned no candles."
             return pd.DataFrame()
         out = pd.concat(frames).sort_index()
-        out = out.loc[(out.index.date >= start) & (out.index.date <= end)]
-        return out
+        return _finalize_ohlc(out, start, end)
     except Exception as e:
         st.session_state.last_loader_error = f"Coinbase error: {e!s}"
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
 def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
-    """Kraken public OHLC. Pair=ETHUSD, interval=1440 (1d)."""
     import requests, time
     try:
         frames = []
@@ -240,7 +238,7 @@ def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
         end_sec = int(pd.Timestamp(end + timedelta(days=1)).timestamp())
         while cur < end_sec:
             url = "https://api.kraken.com/0/public/OHLC"
-            params = {"pair": "ETHUSD", "interval": 1440, "since": cur}
+            params = {"pair":"ETHUSD","interval":1440,"since":cur}
             r = requests.get(url, params=params, timeout=30, headers=_std_headers())
             r.raise_for_status()
             data = r.json()
@@ -257,8 +255,7 @@ def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
             df = pd.DataFrame(rows, columns=["time","open","high","low","close","vwap","volume","count"])
             df["ts"] = pd.to_datetime(df["time"].astype(int), unit="s", utc=True).dt.tz_convert(None)
             df.set_index("ts", inplace=True)
-            df = df[["high","low","close"]].astype(float)
-            df.rename(columns={"high":"High","low":"Low","close":"Close"}, inplace=True)
+            df = df[["high","low","close"]].astype(float).rename(columns={"high":"High","low":"Low","close":"Close"})
             frames.append(df)
             last_ts = int(rows[-1][0])
             cur = last_ts + 24*60*60
@@ -267,14 +264,12 @@ def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
             st.session_state.last_loader_error = "Kraken returned no OHLC."
             return pd.DataFrame()
         out = pd.concat(frames).sort_index()
-        out = out.loc[(out.index.date >= start) & (out.index.date <= end)]
-        return out
+        return _finalize_ohlc(out, start, end)
     except Exception as e:
         st.session_state.last_loader_error = f"Kraken error: {e!s}"
         return pd.DataFrame()
 
 def fetch_ohlc(start: date, end: date, source: str) -> pd.DataFrame:
-    """Try selected source; if empty, cascade through all others."""
     order = {
         "Yahoo Finance":         [fetch_ohlc_yahoo,   fetch_ohlc_coinbase, fetch_ohlc_kraken,  fetch_ohlc_binance,  fetch_ohlc_coingecko],
         "CoinGecko":             [fetch_ohlc_coingecko, fetch_ohlc_coinbase, fetch_ohlc_kraken, fetch_ohlc_binance, fetch_ohlc_yahoo],
@@ -297,10 +292,9 @@ def compute_indicators(ohlc: pd.DataFrame, window_days: int, rsi_period: int, at
         return pd.DataFrame()
 
     close = pd.to_numeric(ohlc["Close"], errors="coerce")
-    high  = pd.to_numeric(ohlc["High"], errors="coerce")
-    low   = pd.to_numeric(ohlc["Low"], errors="coerce")
+    high  = pd.to_numeric(ohlc["High"],  errors="coerce")
+    low   = pd.to_numeric(ohlc["Low"],   errors="coerce")
 
-    # Use chosen window/periods
     roll_max = close.rolling(window=window_days, min_periods=1).max()
 
     delta = close.diff()
@@ -336,7 +330,8 @@ def compute_indicators(ohlc: pd.DataFrame, window_days: int, rsi_period: int, at
         "ATR": atr,
         "ATR_Pct": atr_pct,
     }).dropna(subset=["Close"])
-
+    # ensure unique index in case
+    out = out[~out.index.duplicated(keep="last")]
     return out
 
 def compute_base_signals(ind: pd.DataFrame, threshold_mode: str, fixed_pct: float, atr_mult: float) -> pd.Series:
@@ -345,7 +340,7 @@ def compute_base_signals(ind: pd.DataFrame, threshold_mode: str, fixed_pct: floa
     return cond & (~cond.shift(1).fillna(False))
 
 # --------------------------
-# Simulation
+# Simulation (index-safe iteration)
 # --------------------------
 def simulate_strategy(
     ind: pd.DataFrame,
@@ -370,48 +365,52 @@ def simulate_strategy(
     max_position_value_usd: float = 0.0
 ):
     idx = ind.index
-    close = ind["Close"]
-    roll_max = ind["RollingMax"]
 
-    # starting state
+    # Align signal & coerce to bool array (position-based)
+    if not isinstance(base_signal, pd.Series):
+        base_signal = pd.Series(base_signal, index=idx)
+    signal = base_signal.reindex(idx, fill_value=False).astype(bool).to_numpy()
+
+    close    = ind["Close"].to_numpy()
+    roll_max = ind["RollingMax"].to_numpy()
+    sma50    = ind["SMA50"].to_numpy()
+    sma200   = ind["SMA200"].to_numpy()
+    rsi      = ind["RSI"].to_numpy()
+    drawdown = ind["DrawdownPct"].to_numpy()
+
+    # state
     current_units = start_value_usd / ref_price_usd
     total_cost_excl_fees = start_value_usd
     last_buy_price = ref_price_usd
     last_buy_date = None
-    last_tp_date = None
+    last_tp_date  = None
     last_signal_rollmax_at_buy = None
     month_counts = {}
 
-    # cashflows for XIRR
+    # cashflows
     cashflows_dates = [idx[0].date()]
     cashflows_amounts = [-float(start_value_usd)]
-
     trades = []
+    units_series = pd.Series(index=idx, dtype=float)
 
     def avg_cost_per_unit():
         return total_cost_excl_fees / current_units if current_units > 0 else np.nan
 
-    # Align base signal to indicator index & make it boolean
-    if not isinstance(base_signal, pd.Series):
-        base_signal = pd.Series(base_signal, index=ind.index)
-    signal = base_signal.reindex(ind.index, fill_value=False).astype(bool)
-
-    # iterate days
-    for dt in idx:
-        # take-profit first (optional)
+    for i, dt in enumerate(idx):
+        # ----- take-profit first -----
         if tp_use and current_units > 0:
             can_tp = (last_tp_date is None) or ((dt.date() - last_tp_date).days >= int(tp_cooldown_days))
             if can_tp:
                 basis_price = avg_cost_per_unit() if tp_basis == "Average cost" else last_buy_price
                 if not pd.isna(basis_price):
                     trigger_price = basis_price * (1.0 + float(tp_trigger_pct) / 100.0)
-                    if close.loc[dt] >= trigger_price:
+                    if close[i] >= trigger_price:
                         sell_units = max(0.0, current_units * (float(tp_sell_pct) / 100.0))
                         if sell_units > 0:
-                            exec_price = float(close.loc[dt]) * (1.0 - float(slippage_pct) / 100.0)
+                            exec_price = float(close[i]) * (1.0 - float(slippage_pct) / 100.0)
                             gross = sell_units * exec_price
-                            fee = gross * (float(fee_pct) / 100.0)
-                            net = gross - fee
+                            fee   = gross * (float(fee_pct) / 100.0)
+                            net   = gross - fee
 
                             cost_removed = (avg_cost_per_unit() * sell_units) if not pd.isna(avg_cost_per_unit()) else 0.0
                             total_cost_excl_fees -= cost_removed
@@ -419,43 +418,36 @@ def simulate_strategy(
 
                             cashflows_dates.append(dt.date())
                             cashflows_amounts.append(net)
-
                             trades.append({
-                                "Type": "SELL", "Date": dt.date(),
-                                "Price_Close": float(close.loc[dt]),
-                                "Executed_Price": exec_price,
-                                "Units": -sell_units,
-                                "Gross_Proceeds": gross,
-                                "Fee_%": float(fee_pct),
-                                "Fee_Cash": fee,
-                                "Net_Proceeds": net,
-                                "Basis_Type": tp_basis,
-                                "Basis_Price_Used": float(basis_price),
+                                "Type":"SELL","Date":dt.date(),"Price_Close":float(close[i]),
+                                "Executed_Price":exec_price,"Units":-sell_units,"Gross_Proceeds":gross,
+                                "Fee_%":float(fee_pct),"Fee_Cash":fee,"Net_Proceeds":net,
+                                "Basis_Type":tp_basis,"Basis_Price_Used":float(basis_price),
                             })
                             last_tp_date = dt.date()
 
-        # buy logic (base signal + filters)
+        # ----- buy logic -----
         execute_buy = False
-        if signal.at[dt]:
+        if signal[i]:
             ym = (dt.year, dt.month)
             if (max_signals_per_month > 0) and (month_counts.get(ym, 0) >= max_signals_per_month):
                 execute_buy = False
             else:
                 if (last_buy_date is None) or ((dt.date() - last_buy_date).days >= int(cooldown_days)):
                     if require_new_high_reset and (last_signal_rollmax_at_buy is not None):
-                        execute_buy = bool(roll_max.loc[dt] > last_signal_rollmax_at_buy)
+                        execute_buy = bool(roll_max[i] > last_signal_rollmax_at_buy)
                     else:
                         execute_buy = True
 
         # trend filter
         if execute_buy and trend_filter == "Close > 200D SMA":
-            execute_buy = bool(ind["Close"].loc[dt] > ind["SMA200"].loc[dt])
+            execute_buy = bool(close[i] > sma200[i])
         elif execute_buy and trend_filter == "50D SMA > 200D SMA":
-            execute_buy = bool(ind["SMA50"].loc[dt] > ind["SMA200"].loc[dt])
+            execute_buy = bool(sma50[i] > sma200[i])
 
         # rsi filter
         if execute_buy and use_rsi:
-            rsi_val = ind["RSI"].loc[dt]
+            rsi_val = rsi[i]
             if pd.isna(rsi_val) or not (rsi_val <= float(rsi_max)):
                 execute_buy = False
 
@@ -465,13 +457,13 @@ def simulate_strategy(
             prospective_cash_out = float(buy_amount) * (1.0 + float(fee_pct) / 100.0)
             if (max_invested_usd > 0) and (total_invested_so_far + prospective_cash_out > float(max_invested_usd)):
                 execute_buy = False
-            position_value_now = current_units * float(close.loc[dt])
+            position_value_now = current_units * float(close[i])
             if (max_position_value_usd > 0) and (position_value_now > float(max_position_value_usd)):
                 execute_buy = False
 
         # execute BUY
         if execute_buy:
-            exec_price = float(close.loc[dt]) * (1.0 + float(slippage_pct) / 100.0)
+            exec_price = float(close[i]) * (1.0 + float(slippage_pct) / 100.0)
             units_bought = float(buy_amount) / exec_price
             fee_cash = float(buy_amount) * (float(fee_pct) / 100.0)
             total_cash_out = float(buy_amount) + fee_cash
@@ -479,33 +471,28 @@ def simulate_strategy(
             current_units += units_bought
             total_cost_excl_fees += float(buy_amount)
             last_buy_price = exec_price
-            last_buy_date = dt.date()
-            last_signal_rollmax_at_buy = roll_max.loc[dt]
+            last_buy_date  = dt.date()
+            last_signal_rollmax_at_buy = roll_max[i]
             ym = (dt.year, dt.month)
             month_counts[ym] = month_counts.get(ym, 0) + 1
 
             cashflows_dates.append(dt.date())
             cashflows_amounts.append(-total_cash_out)
-
             trades.append({
-                "Type": "BUY", "Date": dt.date(),
-                "Price_Close": float(close.loc[dt]),
-                "Executed_Price": exec_price,
-                "Units": units_bought,
-                "USD_Spent_Excl_Fee": float(buy_amount),
-                "Fee_%": float(fee_pct),
-                "Fee_Cash": fee_cash,
-                "Total_Cash_Out": total_cash_out,
-                "Drawdown% (on signal)": float(ind["DrawdownPct"].loc[dt]),
-                "RSI": float(ind["RSI"].loc[dt]) if not pd.isna(ind["RSI"].loc[dt]) else np.nan,
-                "SMA50": float(ind["SMA50"].loc[dt]) if not pd.isna(ind["SMA50"].loc[dt]) else np.nan,
-                "SMA200": float(ind["SMA200"].loc[dt]) if not pd.isna(ind["SMA200"].loc[dt]) else np.nan,
+                "Type":"BUY","Date":dt.date(),"Price_Close":float(close[i]),
+                "Executed_Price":exec_price,"Units":units_bought,
+                "USD_Spent_Excl_Fee":float(buy_amount),"Fee_%":float(fee_pct),"Fee_Cash":fee_cash,
+                "Total_Cash_Out":total_cash_out,"Drawdown% (on signal)":float(drawdown[i]),
+                "RSI": float(rsi[i]) if not pd.isna(rsi[i]) else np.nan,
+                "SMA50": float(sma50[i]) if not pd.isna(sma50[i]) else np.nan,
+                "SMA200": float(sma200[i]) if not pd.isna(sma200[i]) else np.nan,
             })
 
-        # track units over time
-        ind.loc[dt, "Units"] = current_units
+        units_series.iloc[i] = current_units
 
-    # terminal metrics
+    ind = ind.copy()
+    ind["Units"] = units_series
+
     portfolio_value = ind["Units"] * ind["Close"]
     terminal_value = float(portfolio_value.iloc[-1])
     cashflows_dates.append(idx[-1].date())
@@ -624,6 +611,9 @@ if ohlc.empty:
             used_source = alt
             break
 
+# Final defensive dedupe (just in case)
+ohlc = _finalize_ohlc(ohlc, start_date, end_date)
+
 st.write(
     f"Using data source: {used_source} · rows: {len(ohlc)} · "
     f"first: {ohlc.index.min() if len(ohlc) else None} · last: {ohlc.index.max() if len(ohlc) else None}"
@@ -635,12 +625,13 @@ if ohlc.empty:
     st.error("No price data returned from any source for the selected dates.")
     st.stop()
 
-# Indicators & signals (use the actual sidebar values)
+# Indicators & signals (use sidebar values)
 ind = compute_indicators(
     ohlc,
-    window_days=int(window_days),
+    window_days=int(st.session_state.get("window_days", 0) or  # in case reruns
+                    locals().get("window_days", DEFAULT_WINDOW_DAYS)),
     rsi_period=int(rsi_period),
-    atr_period=int(DEFAULT_ATR_PERIOD)  # keep UI simpler; change to rsi input if you expose ATR period later
+    atr_period=int(DEFAULT_ATR_PERIOD),
 )
 
 base_signal = compute_base_signals(
