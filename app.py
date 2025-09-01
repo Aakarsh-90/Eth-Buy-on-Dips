@@ -75,6 +75,32 @@ def _finalize_ohlc(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     df = df[keep].dropna(how="any")
     return df
 
+# >>> NEW: quick live spot price with fallbacks (Coinbase → Binance → CoinGecko)
+@st.cache_data(show_spinner=False, ttl=60)
+def fetch_spot_eth_usd():
+    import requests
+    try:
+        r = requests.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=15, headers=_std_headers())
+        r.raise_for_status()
+        amt = float(r.json()["data"]["amount"])
+        return amt, "Coinbase"
+    except Exception:
+        pass
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol":"ETHUSDT"}, timeout=15, headers=_std_headers())
+        r.raise_for_status()
+        amt = float(r.json()["price"])
+        return amt, "Binance"
+    except Exception:
+        pass
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":"ethereum","vs_currencies":"usd"}, timeout=15, headers=_std_headers())
+        r.raise_for_status()
+        amt = float(r.json()["ethereum"]["usd"])
+        return amt, "CoinGecko"
+    except Exception:
+        return np.nan, "—"
+
 # --------------------------
 # Data loaders (Yahoo, CoinGecko, Binance, Coinbase, Kraken)
 # --------------------------
@@ -204,7 +230,8 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
             params = {"granularity":86400, "start":cur.isoformat(), "end":chunk_end.isoformat()}
             r = requests.get(url, params=params, timeout=30, headers=_std_headers())
             if r.status_code == 429:
-                time.sleep(1.0)
+                import time as _t
+                _t.sleep(1.0)
                 r = requests.get(url, params=params, timeout=30, headers=_std_headers())
             r.raise_for_status()
             data = r.json()
@@ -217,7 +244,7 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
             df = df[["high","low","close"]].astype(float).rename(columns={"high":"High","low":"Low","close":"Close"})
             frames.append(df.sort_index())
             cur = chunk_end
-            time.sleep(0.25)
+            _t.sleep(0.25)
         if not frames:
             st.session_state.last_loader_error = "Coinbase returned no candles."
             return pd.DataFrame()
@@ -562,6 +589,17 @@ def format_usd(x):
     except Exception:
         return str(x)
 
+# >>> NEW: small helper to get price on/near an anchor date from an index
+def price_on_or_near(ind_df: pd.DataFrame, anchor: date) -> float:
+    if ind_df is None or ind_df.empty:
+        return float("nan")
+    ts = pd.Timestamp(anchor)
+    if ts in ind_df.index:
+        return float(ind_df.loc[ts, "Close"])
+    # nearest date fallback
+    pos = ind_df.index.get_indexer([ts], method="nearest")[0]
+    return float(ind_df.iloc[pos]["Close"])
+
 # --------------------------
 # UI
 # --------------------------
@@ -675,7 +713,7 @@ base_signal = compute_base_signals(
     atr_mult=float(atr_mult)
 )
 
-# Simulate
+# Simulate (DIP STRATEGY)
 summary, details = simulate_strategy(
     ind=ind,
     base_signal=base_signal,
@@ -700,7 +738,7 @@ summary, details = simulate_strategy(
 )
 
 # --------------------------
-# Output
+# Output (Dip strategy)
 # --------------------------
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Trades executed", f"{summary['n_trades']}")
@@ -709,13 +747,16 @@ m3.metric("Ending value", format_usd(summary["terminal_value"]))
 m4.metric("XIRR (annualized)" if pd.notna(summary["irr_xirr"]) else "XIRR (annualized)",
           f"{summary['irr_xirr']*100:.2f}%" if pd.notna(summary["irr_xirr"]) else "N/A")
 
-# New: show current Avg Cost Basis metric
+# >>> NEW: show Avg Cost and Live Current Price side-by-side
 avg_basis_now = details["ind"]["AvgCostBasis"].iloc[-1] if "AvgCostBasis" in details["ind"].columns else np.nan
-st.metric("Avg cost (current)", format_usd(avg_basis_now) if pd.notna(avg_basis_now) else "—")
+a1, a2 = st.columns(2)
+a1.metric("Avg cost (current)", format_usd(avg_basis_now) if pd.notna(avg_basis_now) else "—")
+spot_price, spot_src = fetch_spot_eth_usd()
+a2.metric("ETH price (now)", f"{format_usd(spot_price) if pd.notna(spot_price) else '—'}" + (f" · {spot_src}" if spot_src and spot_src != "—" else ""))
 
-m5, m6 = st.columns(2)
-m5.metric("Total invested (incl. fees & starting)", format_usd(summary["total_invested"]))
-m6.metric("P/L vs invested", f"{format_usd(summary['absolute_pnl'])} ({summary['pct_return_on_invested']:.2f}%)")
+i1, i2 = st.columns(2)
+i1.metric("Total invested (incl. fees & starting)", format_usd(summary["total_invested"]))
+i2.metric("P/L vs invested", f"{format_usd(summary['absolute_pnl'])} ({summary['pct_return_on_invested']:.2f}%)")
 
 st.divider()
 
@@ -772,6 +813,158 @@ with right:
     st.download_button("Download cash flows (CSV)", data=cf.to_csv(index=False), file_name="cashflows.csv", mime="text/csv")
 
 st.divider()
+
+# >>> NEW: Benchmarks — Buy & Hold and Monthly DCA in tabs
+st.header("📊 Benchmarks (for comparison)")
+
+# Ensure benchmark anchor is available (anchor at 2020-09-27 by spec)
+if ind.index.min().date() > DEFAULT_START_DATE:
+    st.warning("Benchmark anchor is Sep 27, 2020. Your current Start date is later. "
+               "Benchmarks will start from your selected Start date for now.")
+bench_anchor = max(ind.index.min().date(), DEFAULT_START_DATE)
+
+# Work off an index that starts at the benchmark anchor
+ind_bench = ind.loc[pd.Timestamp(bench_anchor):].copy()
+if ind_bench.empty:
+    st.info("Not enough data to compute benchmark tabs for the selected dates.")
+else:
+    # Helper to render charts/tables for a given simulation
+    def render_block(sim_summary, sim_details, label_prefix=""):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades executed", f"{sim_summary['n_trades']}")
+        c2.metric("ETH held (final)", f"{sim_summary['final_eth']:.6f}")
+        c3.metric("Ending value", format_usd(sim_summary["terminal_value"]))
+        c4.metric("XIRR (annualized)" if pd.notna(sim_summary["irr_xirr"]) else "XIRR (annualized)",
+                  f"{sim_summary['irr_xirr']*100:.2f}%" if pd.notna(sim_summary["irr_xirr"]) else "N/A")
+
+        # Avg cost + current spot
+        ab_now = sim_details["ind"]["AvgCostBasis"].iloc[-1] if "AvgCostBasis" in sim_details["ind"].columns else np.nan
+        d1, d2 = st.columns(2)
+        d1.metric("Avg cost (current)", format_usd(ab_now) if pd.notna(ab_now) else "—")
+        _spot, _src = spot_price, spot_src  # reuse the same live spot we fetched above
+        d2.metric("ETH price (now)", f"{format_usd(_spot) if pd.notna(_spot) else '—'}" + (f" · {_src}" if _src and _src != "—" else ""))
+
+        e1, e2 = st.columns(2)
+        e1.metric("Total invested (incl. fees & starting)", format_usd(sim_summary["total_invested"]))
+        e2.metric("P/L vs invested", f"{format_usd(sim_summary['absolute_pnl'])} ({sim_summary['pct_return_on_invested']:.2f}%)")
+
+        st.subheader(f"{label_prefix} ETH Price with Buys & Sells")
+        figp = plt.figure()
+        plt.plot(sim_details["ind"].index, sim_details["ind"]["Close"].values)
+        _tr = sim_details["trades_df"]
+        if not _tr.empty:
+            _buys = _tr[_tr["Type"] == "BUY"]
+            _sells = _tr[_tr["Type"] == "SELL"]
+            if not _buys.empty:
+                _bp_idx = pd.to_datetime(_buys["Date"])
+                plt.scatter(_bp_idx, sim_details["ind"]["Close"].loc[_bp_idx].values, marker="^")
+            if not _sells.empty:
+                _sp_idx = pd.to_datetime(_sells["Date"])
+                plt.scatter(_sp_idx, sim_details["ind"]["Close"].loc[_sp_idx].values, marker="v")
+        plt.title(f"{label_prefix} ETH-USD (Close) — Buys (^) and Sells (v)")
+        plt.xlabel("Date")
+        plt.ylabel("Price (USD)")
+        st.pyplot(figp, use_container_width=True)
+
+        st.subheader(f"{label_prefix} Average Cost Basis Over Time")
+        figc = plt.figure()
+        plt.plot(sim_details["ind"].index, sim_details["ind"]["Close"], label="ETH Close")
+        if "AvgCostBasis" in sim_details["ind"].columns:
+            plt.plot(sim_details["ind"].index, sim_details["ind"]["AvgCostBasis"], label="Avg Cost Basis", linestyle="--")
+        plt.legend()
+        plt.title(f"{label_prefix} Average Cost Basis vs Market Price")
+        plt.xlabel("Date")
+        plt.ylabel("Price (USD)")
+        st.pyplot(figc, use_container_width=True)
+
+        st.subheader(f"{label_prefix} Portfolio Value Over Time")
+        figv = plt.figure()
+        plt.plot(sim_details["portfolio_value"].index, sim_details["portfolio_value"].values)
+        plt.title(f"{label_prefix} Portfolio Value")
+        plt.xlabel("Date")
+        plt.ylabel("Value (USD)")
+        st.pyplot(figv, use_container_width=True)
+
+        lft, rgt = st.columns(2)
+        with lft:
+            st.markdown("### Trades")
+            if not _tr.empty:
+                st.dataframe(_tr, use_container_width=True, hide_index=True)
+                st.download_button("Download trades (CSV)", data=_tr.to_csv(index=False), file_name="trades.csv", mime="text/csv")
+            else:
+                st.info("No trades executed in this benchmark.")
+        with rgt:
+            st.markdown("### Cash Flows (for XIRR)")
+            _cf = sim_details["cashflows"].copy()
+            st.dataframe(_cf, use_container_width=True, hide_index=True)
+            st.download_button("Download cash flows (CSV)", data=_cf.to_csv(index=False), file_name="cashflows.csv", mime="text/csv")
+
+    tabs = st.tabs([
+        "Buy & Hold — $2,500 on 2020-09-27",
+        "Monthly DCA — $2,500 on 2020-09-27 + $250 each 27th"
+    ])
+
+    # --- Benchmark 1: Buy & Hold
+    with tabs[0]:
+        anchor_price = price_on_or_near(ind_bench, bench_anchor)
+        base_sig_bh = pd.Series(False, index=ind_bench.index)  # no extra buys
+        sum_bh, det_bh = simulate_strategy(
+            ind=ind_bench,
+            base_signal=base_sig_bh,
+            buy_amount=0.0,                       # no recurring buys
+            start_value_usd=2500.0,               # initial investment
+            ref_price_usd=float(anchor_price),    # priced at 2020-09-27 (or nearest in index)
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+            cooldown_days=0,
+            trend_filter="None",
+            use_rsi=False,
+            rsi_max=float(rsi_max),
+            require_new_high_reset=False,
+            max_signals_per_month=0,
+            tp_use=False,                          # force no TP for pure buy & hold
+            tp_basis="Average cost",
+            tp_trigger_pct=float(tp_trigger_pct),
+            tp_sell_pct=float(tp_sell_pct),
+            tp_cooldown_days=int(tp_cooldown_days),
+            max_invested_usd=0.0,
+            max_position_value_usd=0.0
+        )
+        render_block(sum_bh, det_bh, label_prefix="Buy & Hold —")
+
+    # --- Benchmark 2: Monthly DCA
+    with tabs[1]:
+        anchor_price = price_on_or_near(ind_bench, bench_anchor)
+        base_sig_dca = pd.Series(False, index=ind_bench.index)
+        # signals on every 27th AFTER the anchor (i.e., start Oct 27, 2020)
+        mask = (ind_bench.index.day == 27) & (ind_bench.index.date > bench_anchor)
+        base_sig_dca.loc[mask] = True
+
+        sum_dca, det_dca = simulate_strategy(
+            ind=ind_bench,
+            base_signal=base_sig_dca,
+            buy_amount=250.0,                      # $250 every 27th
+            start_value_usd=2500.0,                # initial $2,500 on 2020-09-27
+            ref_price_usd=float(anchor_price),
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+            cooldown_days=0,
+            trend_filter="None",                    # unconditional monthly buy
+            use_rsi=False,
+            rsi_max=float(rsi_max),
+            require_new_high_reset=False,
+            max_signals_per_month=0,                # one per month by construction
+            tp_use=False,                           # keep this a pure accumulate strategy
+            tp_basis="Average cost",
+            tp_trigger_pct=float(tp_trigger_pct),
+            tp_sell_pct=float(tp_sell_pct),
+            tp_cooldown_days=int(tp_cooldown_days),
+            max_invested_usd=0.0,
+            max_position_value_usd=0.0
+        )
+        render_block(sum_dca, det_dca, label_prefix="Monthly DCA —")
+
+st.divider()
 st.markdown(
     """
 **Methodology & Controls**
@@ -782,5 +975,6 @@ st.markdown(
 - Caps: skip if total invested or position value would exceed caps.
 - Performance: XIRR from cash flows.
 - Data sources: Coinbase, Kraken, Yahoo, Binance, CoinGecko — with automatic fallback.
+- **Benchmarks:** (1) Buy & Hold = single $2,500 purchase on 2020-09-27; (2) Monthly DCA = $2,500 on 2020-09-27, then $250 on each 27th. Both benchmarks ignore TP/filters.
 """
 )
