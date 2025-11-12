@@ -1,7 +1,8 @@
-# app.py — Buy-on-Dips Multi-Asset Dashboard with data-source fallbacks
+# app.py — Buy-on-Dips Multi-Asset Dashboard with SIP + HYSA fallback
 
 import io
 import time
+import calendar
 from datetime import date, timedelta
 
 import matplotlib.pyplot as plt
@@ -130,6 +131,24 @@ def price_on_or_near(ind_df: pd.DataFrame, anchor: date) -> float:
         return float(ind_df.loc[ts, "Close"])
     pos = ind_df.index.get_indexer([ts], method="nearest")[0]
     return float(ind_df.iloc[pos]["Close"])
+
+
+def generate_month_list(start_dt: date, end_dt: date):
+    """List of (year, month) from start_dt..end_dt inclusive."""
+    months = []
+    cur = date(start_dt.year, start_dt.month, 1)
+    while cur <= end_dt:
+        months.append((cur.year, cur.month))
+        if cur.month == 12:
+            cur = date(cur.year + 1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month + 1, 1)
+    return months
+
+
+def month_end(y: int, m: int) -> date:
+    last_day = calendar.monthrange(y, m)[1]
+    return date(y, m, last_day)
 
 
 # ----------------------------------------------------
@@ -991,6 +1010,18 @@ ref_price_usd = st.sidebar.number_input(
     step=0.01,
 )
 
+st.sidebar.divider()
+st.sidebar.header("Monthly SIP (multi-asset)")
+monthly_sip_budget = st.sidebar.number_input(
+    "Monthly SIP budget (USD, across all 4 assets)",
+    min_value=0.0,
+    value=1000.0,
+    step=100.0,
+)
+hysa_apy = st.sidebar.number_input(
+    "HYSA APY (%)", min_value=0.0, max_value=20.0, value=4.0, step=0.1
+)
+
 # ----------------------------------------------------
 # SINGLE-ASSET VIEW
 # ----------------------------------------------------
@@ -1165,7 +1196,7 @@ st.divider()
 # ----------------------------------------------------
 # MULTI-ASSET DASHBOARD + COMPARISON CSV
 # ----------------------------------------------------
-st.header("🧪 Multi-Asset Dashboard (same parameters across all)")
+st.header("🧪 Multi-Asset Dashboard (same parameters)")
 dash_tabs = st.tabs([ASSETS[k]["label"] for k in ASSETS.keys()])
 
 def run_strategy_for_asset_key(key: str):
@@ -1290,6 +1321,200 @@ if compare_rows:
 st.divider()
 
 # ----------------------------------------------------
+# MONTHLY SIP + HYSA FALLBACK
+# ----------------------------------------------------
+st.header("💸 Monthly SIP with HYSA fallback")
+
+if monthly_sip_budget > 0:
+    n_assets = len(ASSETS)
+    per_asset_sip = monthly_sip_budget / float(n_assets) if n_assets > 0 else 0.0
+    months_list = generate_month_list(start_date, end_date)
+
+    sip_results = {}
+    asset_buy_months = {k: set() for k in ASSETS.keys()}
+
+    # Run SIP-style strategy: start at 0, max 1 buy / asset / month, buy_amount = per_asset_sip
+    for key in ASSETS.keys():
+        df, used_sym = fetch_ohlc(start_date, end_date, data_source, key)
+        df = _finalize_ohlc(df, start_date, end_date)
+        if df is None or df.empty:
+            continue
+        ii = compute_indicators(
+            df,
+            window_days=int(window_days),
+            rsi_period=int(rsi_period),
+            atr_period=int(DEFAULT_ATR_PERIOD),
+        )
+        sig = compute_base_signals(
+            ii,
+            threshold_mode=threshold_mode,
+            fixed_pct=float(threshold_pct),
+            atr_mult=float(atr_mult),
+        )
+
+        # Reference price for starting units (we start at 0, but ref is used internally)
+        if ASSETS[key]["kind"] == "crypto":
+            ref_guess = ref_price_usd
+        else:
+            ref_guess = price_on_or_near(
+                ii[["Close"]].rename(columns={"Close": "Close"}), start_date
+            )
+            if pd.isna(ref_guess) or ref_guess <= 0:
+                ref_guess = ref_price_usd
+
+        summ_sip, det_sip = simulate_strategy(
+            ind=ii,
+            base_signal=sig,
+            buy_amount=float(per_asset_sip),
+            start_value_usd=0.0,  # SIP-only portfolio
+            ref_price_usd=float(ref_guess),
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+            cooldown_days=int(cooldown_days),
+            trend_filter=trend_filter,
+            use_rsi=bool(use_rsi),
+            rsi_max=float(rsi_max),
+            require_new_high_reset=bool(require_new_high_reset),
+            max_signals_per_month=1,  # <=1 buy per asset per month
+            tp_use=bool(tp_use),
+            tp_basis=str(tp_basis),
+            tp_trigger_pct=float(tp_trigger_pct),
+            tp_sell_pct=float(tp_sell_pct),
+            tp_cooldown_days=int(tp_cooldown_days),
+            max_invested_usd=0.0 if max_invested_usd == 0 else float(max_invested_usd),
+            max_position_value_usd=0.0
+            if max_position_value_usd == 0
+            else float(max_position_value_usd),
+        )
+
+        sip_results[key] = (used_sym, summ_sip, det_sip)
+
+        tr = det_sip["trades_df"]
+        if not tr.empty:
+            buys = tr[tr["Type"] == "BUY"]
+            for d in pd.to_datetime(buys["Date"]).dt.date:
+                asset_buy_months[key].add((d.year, d.month))
+
+    # HYSA flows: unused slices each month
+    hysa_contrib_rows = []
+    balance = 0.0
+    hysa_cashflow_dates = []
+    hysa_cashflow_amounts = []
+    monthly_rate = (hysa_apy / 100.0) / 12.0 if hysa_apy > 0 else 0.0
+
+    for (y, m) in months_list:
+        month_end_dt = month_end(y, m)
+        if month_end_dt < start_date or month_end_dt > end_date:
+            continue
+        invested_this_month = 0.0
+        for key in ASSETS.keys():
+            if (y, m) in asset_buy_months[key]:
+                invested_this_month += per_asset_sip
+        hysa_contrib = monthly_sip_budget - invested_this_month
+        if hysa_contrib < 0:
+            hysa_contrib = 0.0  # should not happen, but safety
+
+        if hysa_contrib > 0:
+            balance += hysa_contrib
+            hysa_cashflow_dates.append(month_end_dt)
+            hysa_cashflow_amounts.append(-hysa_contrib)
+
+        if monthly_rate > 0 and balance > 0:
+            interest = balance * monthly_rate
+            balance += interest
+
+        hysa_contrib_rows.append(
+            {
+                "MonthEnd": month_end_dt,
+                "Invested Into Assets": invested_this_month,
+                "HYSA Contribution": hysa_contrib,
+                "HYSA Balance": balance,
+            }
+        )
+
+    if balance > 0:
+        hysa_cashflow_dates.append(end_date)
+        hysa_cashflow_amounts.append(balance)
+
+    hysa_irr = (
+        robust_xirr(pd.to_datetime(hysa_cashflow_dates), hysa_cashflow_amounts)
+        if hysa_cashflow_dates
+        else np.nan
+    )
+    total_hysa_invested = float(-sum(a for a in hysa_cashflow_amounts if a < 0))
+    hysa_abs_pnl = (
+        balance - total_hysa_invested if total_hysa_invested > 0 else 0.0
+    )
+
+    # SIP summary table
+    rows = []
+    for key in ASSETS.keys():
+        if key in sip_results:
+            used_sym, summ_sip, det_sip = sip_results[key]
+            rows.append(
+                {
+                    "Asset": key,
+                    "Symbol": used_sym,
+                    "Total Invested (USD)": summ_sip["total_invested"],
+                    "Terminal Value (USD)": summ_sip["terminal_value"],
+                    "Abs P&L (USD)": summ_sip["absolute_pnl"],
+                    "P&L % on Invested": summ_sip["pct_return_on_invested"],
+                    "XIRR": summ_sip["irr_xirr"],
+                    "Trades": summ_sip["n_trades"],
+                }
+            )
+    rows.append(
+        {
+            "Asset": "HYSA",
+            "Symbol": "HYSA",
+            "Total Invested (USD)": total_hysa_invested,
+            "Terminal Value (USD)": balance,
+            "Abs P&L (USD)": hysa_abs_pnl,
+            "P&L % on Invested": (balance / total_hysa_invested - 1.0) * 100.0
+            if total_hysa_invested > 0
+            else np.nan,
+            "XIRR": hysa_irr,
+            "Trades": 0,
+        }
+    )
+    sip_cmp_df = pd.DataFrame(rows)
+    st.subheader("SIP + HYSA comparison")
+    st.dataframe(
+        sip_cmp_df.style.format(
+            {
+                "Total Invested (USD)": "{:,.2f}",
+                "Terminal Value (USD)": "{:,.2f}",
+                "Abs P&L (USD)": "{:,.2f}",
+                "P&L % on Invested": "{:.2f}",
+                "XIRR": "{:.4f}",
+            }
+        ),
+        use_container_width=True,
+    )
+    st.download_button(
+        "Download SIP + HYSA comparison (CSV)",
+        data=sip_cmp_df.to_csv(index=False),
+        file_name="sip_hysa_comparison.csv",
+        mime="text/csv",
+        key="dl_sip_hysa_cmp",
+    )
+
+    if hysa_contrib_rows:
+        hysa_df = pd.DataFrame(hysa_contrib_rows).set_index("MonthEnd")
+        st.subheader("HYSA Balance Over Time")
+        fig_hysa = plt.figure()
+        plt.plot(hysa_df.index, hysa_df["HYSA Balance"])
+        plt.title("HYSA Balance (SIP fallback)")
+        plt.xlabel("Date")
+        plt.ylabel("Balance (USD)")
+        st.pyplot(fig_hysa, use_container_width=True)
+
+        st.markdown("**SIP allocation per month**")
+        st.dataframe(hysa_df, use_container_width=True)
+
+st.divider()
+
+# ----------------------------------------------------
 # CORRELATION & BETA (1y / 3y / 5y)
 # ----------------------------------------------------
 st.header("📈 Correlation & Beta (1y / 3y / 5y)")
@@ -1318,7 +1543,7 @@ def corr_beta_tables(end_dt: date, years: int):
     corr = rets.corr()
     cov = rets.cov()
     var = np.diag(cov.values)
-    beta = pd.DataFrame(index=cov.index, columns=cov.columns, dtype=float)
+    beta = pd.DataFrame(index	cov.index, columns=cov.columns, dtype=float)
     for i in cov.index:
         for j_idx, j in enumerate(cov.columns):
             denom = var[j_idx]
@@ -1372,7 +1597,10 @@ st.markdown(
 - Data:
   - ETH-USD: Coinbase → Kraken → Binance → Yahoo Finance fallback.
   - GLD / ^SOX / ARTY: Yahoo Finance on multiple tickers → Stooq (.us) CSV fallback.
-- Benchmarks in this version are omitted to keep code size manageable, but logic is identical to the main strategy.
+- Multi-asset SIP:
+  - Monthly SIP = slider (default $1,000).
+  - Each asset gets SIP/4 slice (e.g., $250) if it fires at least one BUY that month (with all your filters).
+  - Unused slices go to HYSA, which compounds monthly at the chosen APY.
 - Correlation/Beta: daily pct-change returns; βᵢ⟂ⱼ = Cov(i,j)/Var(j) (row vs column).
 """
 )
