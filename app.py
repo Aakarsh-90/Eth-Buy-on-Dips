@@ -6,7 +6,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 from datetime import date, timedelta
 
-# IMPORTANT: page config must be the FIRST Streamlit call and only called ONCE.
+# IMPORTANT: Must be first Streamlit call and only called once
 st.set_page_config(page_title="Buy-the-Dip (Multi-Asset)", layout="wide")
 
 # --------------------------
@@ -22,17 +22,21 @@ ASSETS = {
 DEFAULT_START_DATE = date(2020, 9, 27)
 DEFAULT_FIXED_END_DATE = date(2025, 8, 27)
 
+# Core dip heuristic
 DEFAULT_THRESHOLD_PCT = 5.0
 DEFAULT_WINDOW_DAYS = 7
 DEFAULT_BUY_AMOUNT = 150.0
 
+# Starting portfolio (ETH anchor)
 DEFAULT_START_VALUE = 2500.00
-DEFAULT_REF_PRICE   = 354.31  # ETH anchor for your portfolio start
+DEFAULT_REF_PRICE   = 354.31
 
+# Trading frictions
 DEFAULT_FEE_PCT = 0.10
 DEFAULT_SLIPPAGE_PCT = 0.05
 DEFAULT_COOLDOWN_DAYS = 0
 
+# Improvement options
 DEFAULT_ATR_PERIOD = 14
 DEFAULT_ATR_MULT   = 2.0
 DEFAULT_RSI_PERIOD = 14
@@ -40,15 +44,18 @@ DEFAULT_RSI_MAX    = 45.0
 DEFAULT_REQUIRE_NEW_HIGH_RESET = False
 DEFAULT_MAX_SIG_PER_MONTH = 0
 
+# Take-profit / rebalance
 DEFAULT_TP_USE = False
 DEFAULT_TP_BASIS = "Average cost"
 DEFAULT_TP_TRIGGER_PCT = 20.0
 DEFAULT_TP_SELL_PCT = 10.0
 DEFAULT_TP_COOLDOWN_DAYS = 7
 
+# Allocation caps
 DEFAULT_MAX_INVESTED_USD = 0.0
 DEFAULT_MAX_POSITION_VALUE_USD = 0.0
 
+# Debug bucket
 if "last_loader_error" not in st.session_state:
     st.session_state.last_loader_error = ""
 
@@ -64,6 +71,7 @@ def _std_headers():
     }
 
 def _finalize_ohlc(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """Standardize index, sort, slice, and drop duplicates + NaNs."""
     if df is None or df.empty:
         return pd.DataFrame()
     df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -75,7 +83,7 @@ def _finalize_ohlc(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     return df
 
 # --------------------------
-# Live spot helpers
+# Spot price helpers
 # --------------------------
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_spot_eth_usd():
@@ -110,20 +118,39 @@ def fetch_spot_yahoo_close(ticker: str):
         return np.nan, "—"
 
 # --------------------------
-# Data loaders (ETH multi-source; others from Yahoo)
+# Data loaders (ETH multi-source; others via Yahoo)
 # --------------------------
+def _flatten_multiindex_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        new_cols = []
+        for tup in df.columns:
+            parts = [str(x) for x in tup if x not in (None, "", " ")]
+            new_cols.append("_".join(parts) if parts else "col")
+        df.columns = new_cols
+    return df
+
 @st.cache_data(show_spinner=False)
 def fetch_ohlc_yahoo(start: date, end: date) -> pd.DataFrame:
     try:
-        df = yf.download("ETH-USD", start=start, end=end + timedelta(days=1), interval="1d", progress=False, auto_adjust=False)
+        df = yf.download(
+            "ETH-USD",
+            start=start,
+            end=end + timedelta(days=1),  # yfinance end is exclusive
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
         if df is None or df.empty:
             return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ["_".join([c for c in col if c]) for c in df.columns]
+
+        df = _flatten_multiindex_columns(df)
+
         def pick_col(name):
-            if name in df.columns: return df[name]
+            if name in df.columns:
+                return df[name]
             cands = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
             return df[cands[0]] if cands else pd.Series(index=df.index, dtype="float64")
+
         out = pd.DataFrame({
             "High":  pd.to_numeric(pick_col("High"),  errors="coerce"),
             "Low":   pd.to_numeric(pick_col("Low"),   errors="coerce"),
@@ -132,6 +159,38 @@ def fetch_ohlc_yahoo(start: date, end: date) -> pd.DataFrame:
         return _finalize_ohlc(out, start, end)
     except Exception as e:
         st.session_state.last_loader_error = f"Yahoo error: {e!s}"
+        return pd.DataFrame()
+
+@st.cache_data(show_spinner=False)
+def fetch_ohlc_yahoo_generic(ticker: str, start: date, end: date) -> pd.DataFrame:
+    try:
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end + timedelta(days=1),
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = _flatten_multiindex_columns(df)
+
+        def pick_col(name: str):
+            if name in df.columns:
+                return df[name]
+            cands = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
+            return df[cands[0]] if cands else pd.Series(index=df.index, dtype="float64")
+
+        out = pd.DataFrame({
+            "High":  pd.to_numeric(pick_col("High"),  errors="coerce"),
+            "Low":   pd.to_numeric(pick_col("Low"),   errors="coerce"),
+            "Close": pd.to_numeric(pick_col("Close"), errors="coerce"),
+        })
+        return _finalize_ohlc(out, start, end)
+    except Exception as e:
+        st.session_state.last_loader_error = f"Yahoo generic fatal: {e!s}"
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
@@ -146,12 +205,15 @@ def fetch_ohlc_coingecko(start: date, end: date) -> pd.DataFrame:
         if "prices" not in data or len(data["prices"]) == 0:
             st.session_state.last_loader_error = "CoinGecko returned no 'prices'."
             return pd.DataFrame()
+
         prices = pd.DataFrame(data["prices"], columns=["ts_ms", "price"])
         prices["ts"] = pd.to_datetime(prices["ts_ms"], unit="ms", utc=True).dt.tz_convert(None)
         prices = prices.set_index("ts").sort_index()
+
         start_ts = pd.to_datetime(start) - pd.Timedelta(days=1)
         end_ts   = pd.to_datetime(end)   + pd.Timedelta(days=1)
         prices = prices.loc[(prices.index >= start_ts) & (prices.index <= end_ts)]
+
         daily = prices["price"].resample("D").agg(["max", "min", "last"]).dropna(how="any")
         daily.rename(columns={"max": "High", "min": "Low", "last": "Close"}, inplace=True)
         out = daily[["High", "Low", "Close"]].copy()
@@ -176,7 +238,8 @@ def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
                 return pd.DataFrame()
             r.raise_for_status()
             klines = r.json()
-            if not klines: break
+            if not klines:
+                break
             df = pd.DataFrame(klines, columns=[
                 "open_time","open","high","low","close","volume","close_time",
                 "quote_asset_volume","number_of_trades","taker_buy_base",
@@ -184,7 +247,8 @@ def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
             ])
             df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(None)
             df.set_index("ts", inplace=True)
-            df = df[["high","low","close"]].astype(float).rename(columns={"high":"High","low":"Low","close":"Close"})
+            df = df[["high","low","close"]].astype(float)
+            df.rename(columns={"high":"High","low":"Low","close":"Close"}, inplace=True)
             frames.append(df)
             last_open = int(klines[-1][0])
             cur = last_open + 24*60*60*1000
@@ -235,67 +299,8 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
         st.session_state.last_loader_error = f"Coinbase error: {e!s}"
         return pd.DataFrame()
 
-@st.cache_data(show_spinner=False)
-def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
-    import requests, time
-    try:
-        frames = []
-        cur = int(pd.Timestamp(start).timestamp())
-        end_sec = int(pd.Timestamp(end + timedelta(days=1)).timestamp())
-        while cur < end_sec:
-            url = "https://api.kraken.com/0/public/OHLC"
-            params = {"pair":"ETHUSD","interval":1440,"since":cur}
-            r = requests.get(url, params=params, timeout=30, headers=_std_headers())
-            r.raise_for_status()
-            data = r.json()
-            if data.get("error"):
-                st.session_state.last_loader_error = f"Kraken error: {data['error']}"
-                break
-            result = data.get("result", {})
-            key = next((k for k in result.keys() if k not in ("last")), None)
-            if not key: break
-            rows = result[key]
-            if not rows: break
-            df = pd.DataFrame(rows, columns=["time","open","high","low","close","vwap","volume","count"])
-            df["ts"] = pd.to_datetime(df["time"].astype(int), unit="s", utc=True).dt.tz_convert(None)
-            df.set_index("ts", inplace=True)
-            df = df[["high","low","close"]].astype(float).rename(columns={"high":"High","low":"Low","close":"Close"})
-            frames.append(df)
-            last_ts = int(rows[-1][0])
-            cur = last_ts + 24*60*60
-            time.sleep(0.25)
-        if not frames:
-            st.session_state.last_loader_error = "Kraken returned no OHLC."
-            return pd.DataFrame()
-        out = pd.concat(frames).sort_index()
-        return _finalize_ohlc(out, start, end)
-    except Exception as e:
-        st.session_state.last_loader_error = f"Kraken error: {e!s}"
-        return pd.DataFrame()
-
-@st.cache_data(show_spinner=False)
-def fetch_ohlc_yahoo_generic(ticker: str, start: date, end: date) -> pd.DataFrame:
-    try:
-        df = yf.download(ticker, start=start, end=end + timedelta(days=1), interval="1d", progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ["_".join([c for c in col if c]) for c in df.columns]
-        def pick_col(name):
-            if name in df.columns: return df[name]
-            cands = [c for c in df.columns if c.split("_")[-1] == name or c.split(" ")[-1] == name]
-            return df[cands[0]] if cands else pd.Series(index=df.index, dtype="float64")
-        out = pd.DataFrame({
-            "High":  pd.to_numeric(pick_col("High"),  errors="coerce"),
-            "Low":   pd.to_numeric(pick_col("Low"),   errors="coerce"),
-            "Close": pd.to_numeric(pick_col("Close"), errors="coerce"),
-        })
-        return _finalize_ohlc(out, start, end)
-    except Exception as e:
-        st.session_state.last_loader_error = f"Yahoo generic fatal: {e!s}"
-        return pd.DataFrame()
-
 def fetch_ohlc(start: date, end: date, source: str, ticker: str) -> pd.DataFrame:
+    """Unified fetch. For ETH-USD honors crypto fallbacks; others use Yahoo."""
     kind = ASSETS.get(ticker, {}).get("kind", "etf")
     if kind == "crypto" and ticker.upper() == "ETH-USD":
         order = {
@@ -310,7 +315,7 @@ def fetch_ohlc(start: date, end: date, source: str, ticker: str) -> pd.DataFrame
             if df is not None and not df.empty:
                 return df
         return pd.DataFrame()
-    # Non-crypto: use Yahoo
+    # Non-crypto: Yahoo only
     return fetch_ohlc_yahoo_generic(ticker, start, end)
 
 # --------------------------
@@ -322,25 +327,41 @@ def compute_indicators(ohlc: pd.DataFrame, window_days: int, rsi_period: int, at
     close = pd.to_numeric(ohlc["Close"], errors="coerce")
     high  = pd.to_numeric(ohlc["High"],  errors="coerce")
     low   = pd.to_numeric(ohlc["Low"],   errors="coerce")
+
     roll_max = close.rolling(window=window_days, min_periods=1).max()
+
     delta = close.diff()
-    up = delta.clip(lower=0); down = -delta.clip(upper=0)
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
     roll_up = up.ewm(alpha=1/float(rsi_period), adjust=False).mean()
     roll_down = down.ewm(alpha=1/float(rsi_period), adjust=False).mean()
     rs = roll_up / roll_down.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
+
     prev_close = close.shift(1)
-    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1/float(atr_period), adjust=False).mean()
+
     drawdown_pct = (roll_max - close) / roll_max * 100.0
     sma50  = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
     atr_pct = (atr / close) * 100.0
+
     out = pd.DataFrame({
-        "Close": close, "High": high, "Low": low,
-        "RollingMax": roll_max, "DrawdownPct": drawdown_pct,
-        "SMA50": sma50, "SMA200": sma200, "RSI": rsi,
-        "ATR": atr, "ATR_Pct": atr_pct,
+        "Close": close,
+        "High": high,
+        "Low": low,
+        "RollingMax": roll_max,
+        "DrawdownPct": drawdown_pct,
+        "SMA50": sma50,
+        "SMA200": sma200,
+        "RSI": rsi,
+        "ATR": atr,
+        "ATR_Pct": atr_pct,
     }).dropna(subset=["Close"])
     out = out[~out.index.duplicated(keep="last")]
     return out
@@ -351,6 +372,7 @@ def compute_base_signals(ind: pd.DataFrame, threshold_mode: str, fixed_pct: floa
     return cond & (~cond.shift(1).fillna(False))
 
 def robust_xirr(dates, amounts):
+    """Stable XIRR via bisection. Merges same-day cashflows, requires both signs."""
     if len(dates) != len(amounts) or len(dates) == 0:
         return np.nan
     dfcf = pd.DataFrame({"date": pd.to_datetime(dates).date, "amt": amounts})
@@ -372,9 +394,12 @@ def robust_xirr(dates, amounts):
     for _ in range(200):
         mid = (lo + hi) / 2.0
         f_mid = npv(mid)
-        if abs(f_mid) < 1e-10: return mid
-        if f_lo * f_mid <= 0: hi, f_hi = mid, f_mid
-        else: lo, f_lo = mid, f_mid
+        if abs(f_mid) < 1e-10:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
     return (lo + hi) / 2.0
 
 # --------------------------
@@ -403,6 +428,8 @@ def simulate_strategy(
     max_position_value_usd: float = 0.0
 ):
     idx = ind.index
+
+    # Align signal
     if not isinstance(base_signal, pd.Series):
         base_signal = pd.Series(base_signal, index=idx)
     signal = base_signal.reindex(idx, fill_value=False).astype(bool).to_numpy()
@@ -414,6 +441,7 @@ def simulate_strategy(
     rsi      = ind["RSI"].to_numpy()
     drawdown = ind["DrawdownPct"].to_numpy()
 
+    # state
     current_units = start_value_usd / ref_price_usd if ref_price_usd > 0 else 0.0
     total_cost_excl_fees = start_value_usd
     last_buy_price = ref_price_usd
@@ -422,10 +450,12 @@ def simulate_strategy(
     last_signal_rollmax_at_buy = None
     month_counts = {}
 
+    # cashflows
     cashflows_dates = [idx[0].date()]
     cashflows_amounts = [-float(start_value_usd)]
     trades = []
 
+    # series
     units_series = pd.Series(index=idx, dtype=float)
     cost_basis_series = pd.Series(index=idx, dtype=float)
 
@@ -433,7 +463,7 @@ def simulate_strategy(
         return total_cost_excl_fees / current_units if current_units > 0 else np.nan
 
     for i, dt in enumerate(idx):
-        # take-profit first
+        # take-profit
         if tp_use and current_units > 0:
             can_tp = (last_tp_date is None) or ((dt.date() - last_tp_date).days >= int(tp_cooldown_days))
             if can_tp:
@@ -450,7 +480,8 @@ def simulate_strategy(
                             cost_removed = (avg_cost_per_unit() * sell_units) if not pd.isna(avg_cost_per_unit()) else 0.0
                             total_cost_excl_fees -= cost_removed
                             current_units -= sell_units
-                            cashflows_dates.append(dt.date()); cashflows_amounts.append(net)
+                            cashflows_dates.append(dt.date())
+                            cashflows_amounts.append(net)
                             trades.append({
                                 "Type":"SELL","Date":dt.date(),"Price_Close":float(close[i]),
                                 "Executed_Price":exec_price,"Units":-sell_units,"Gross_Proceeds":gross,
@@ -472,16 +503,19 @@ def simulate_strategy(
                     else:
                         execute_buy = True
 
+        # trend filter
         if execute_buy and trend_filter == "Close > 200D SMA":
             execute_buy = bool(close[i] > sma200[i])
         elif execute_buy and trend_filter == "50D SMA > 200D SMA":
             execute_buy = bool(sma50[i] > sma200[i])
 
+        # rsi filter
         if execute_buy and use_rsi:
             rsi_val = rsi[i]
             if pd.isna(rsi_val) or not (rsi_val <= float(rsi_max)):
                 execute_buy = False
 
+        # allocation caps
         if execute_buy:
             total_invested_so_far = -sum(a for a in cashflows_amounts if a < 0)
             prospective_cash_out = float(buy_amount) * (1.0 + float(fee_pct) / 100.0)
@@ -491,11 +525,13 @@ def simulate_strategy(
             if (max_position_value_usd > 0) and (position_value_now > float(max_position_value_usd)):
                 execute_buy = False
 
+        # execute buy
         if execute_buy:
             exec_price = float(close[i]) * (1.0 + float(slippage_pct) / 100.0)
             units_bought = float(buy_amount) / exec_price
             fee_cash = float(buy_amount) * (float(fee_pct) / 100.0)
             total_cash_out = float(buy_amount) + fee_cash
+
             current_units += units_bought
             total_cost_excl_fees += float(buy_amount)
             last_buy_price = exec_price
@@ -503,7 +539,9 @@ def simulate_strategy(
             last_signal_rollmax_at_buy = roll_max[i]
             ym = (dt.year, dt.month)
             month_counts[ym] = month_counts.get(ym, 0) + 1
-            cashflows_dates.append(dt.date()); cashflows_amounts.append(-total_cash_out)
+
+            cashflows_dates.append(dt.date())
+            cashflows_amounts.append(-total_cash_out)
             trades.append({
                 "Type":"BUY","Date":dt.date(),"Price_Close":float(close[i]),
                 "Executed_Price":exec_price,"Units":units_bought,
@@ -514,16 +552,21 @@ def simulate_strategy(
                 "SMA200": float(sma200[i]) if not pd.isna(sma200[i]) else np.nan,
             })
 
+        # record daily state
         units_series.iloc[i] = current_units
         cost_basis_series.iloc[i] = (total_cost_excl_fees / current_units) if current_units > 0 else np.nan
 
+    # attach series
     ind = ind.copy()
     ind["Units"] = units_series
     ind["AvgCostBasis"] = cost_basis_series
+
+    # terminal metrics
     portfolio_value = ind["Units"] * ind["Close"]
     terminal_value = float(portfolio_value.iloc[-1])
     cashflows_dates.append(idx[-1].date())
     cashflows_amounts.append(terminal_value)
+
     irr = robust_xirr(pd.to_datetime(cashflows_dates), cashflows_amounts)
     total_invested = float(-sum(a for a in cashflows_amounts if a < 0))
     summary = {
@@ -638,23 +681,21 @@ ref_price_usd = st.sidebar.number_input("Reference price to back into units", mi
 # --------------------------
 primary = data_source
 ticker  = asset_key
+
 ohlc = fetch_ohlc(start_date, end_date, source=primary, ticker=ticker)
 used_source = primary
 
 if ohlc.empty:
+    # For non-crypto, Kraken/Binance will always be empty; fall back to Yahoo
     st.warning(f"{primary} returned 0 rows; trying Yahoo Finance…")
-    alt = "Yahoo Finance"
-    if alt != primary:
-        if ASSETS[ticker]["kind"] == "crypto" and ticker == "ETH-USD":
-            ohlc = fetch_ohlc(start_date, end_date, source=alt, ticker=ticker)
-        else:
-            ohlc = fetch_ohlc_yahoo_generic(ticker, start_date, end_date)
-        if not ohlc.empty:
-            used_source = alt
+    ohlc = fetch_ohlc_yahoo_generic(ticker, start_date, end_date) if ASSETS[ticker]["kind"] != "crypto" \
+           else fetch_ohlc(start_date, end_date, source="Yahoo Finance", ticker=ticker)
+    if not ohlc.empty:
+        used_source = "Yahoo Finance"
 
 ohlc = _finalize_ohlc(ohlc, start_date, end_date)
 
-# if user clicked set-ref button, set it now that ohlc is loaded
+# Apply "set ref = start close" if clicked
 if "_ref_price_override" in st.session_state and st.session_state["_ref_price_override"] is None and not ohlc.empty:
     try:
         st.session_state["_ref_price_override"] = float(price_on_or_near(pd.DataFrame({"Close": ohlc["Close"]}), start_date))
@@ -668,13 +709,24 @@ st.write(
 )
 if len(st.session_state.last_loader_error) and ohlc.empty:
     st.info("Last loader error: " + st.session_state.last_loader_error)
+
 if ohlc.empty:
     st.error("No price data returned from any source for the selected dates.")
     st.stop()
 
 # Indicators & signals
-ind = compute_indicators(ohlc, window_days=int(window_days), rsi_period=int(rsi_period), atr_period=int(DEFAULT_ATR_PERIOD))
-base_signal = compute_base_signals(ind, threshold_mode=threshold_mode, fixed_pct=float(threshold_pct), atr_mult=float(atr_mult))
+ind = compute_indicators(
+    ohlc,
+    window_days=int(window_days),
+    rsi_period=int(rsi_period),
+    atr_period=int(DEFAULT_ATR_PERIOD),
+)
+base_signal = compute_base_signals(
+    ind,
+    threshold_mode=threshold_mode,
+    fixed_pct=float(threshold_pct),
+    atr_mult=float(atr_mult)
+)
 
 # Simulate (selected asset)
 summary, details = simulate_strategy(
@@ -854,16 +906,28 @@ if ind_bench.empty:
 else:
     with tabs[0]:
         anchor_price = price_on_or_near(ind_bench, bench_anchor)
-        base_sig_bh = pd.Series(False, index=ind_bench.index)
+        base_sig_bh = pd.Series(False, index=ind_bench.index)  # no recurring buys
         sum_bh, det_bh = simulate_strategy(
-            ind=ind_bench, base_signal=base_sig_bh, buy_amount=0.0,
-            start_value_usd=2500.0, ref_price_usd=float(anchor_price),
-            fee_pct=float(fee_pct), slippage_pct=float(slippage_pct),
-            cooldown_days=0, trend_filter="None", use_rsi=False, rsi_max=float(rsi_max),
-            require_new_high_reset=False, max_signals_per_month=0, tp_use=False,
-            tp_basis="Average cost", tp_trigger_pct=float(tp_trigger_pct),
-            tp_sell_pct=float(tp_sell_pct), tp_cooldown_days=int(tp_cooldown_days),
-            max_invested_usd=0.0, max_position_value_usd=0.0
+            ind=ind_bench,
+            base_signal=base_sig_bh,
+            buy_amount=0.0,  # no recurring buys
+            start_value_usd=2500.0,
+            ref_price_usd=float(anchor_price),
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+            cooldown_days=0,
+            trend_filter="None",
+            use_rsi=False,
+            rsi_max=float(rsi_max),
+            require_new_high_reset=False,
+            max_signals_per_month=0,
+            tp_use=False,
+            tp_basis="Average cost",
+            tp_trigger_pct=float(tp_trigger_pct),
+            tp_sell_pct=float(tp_sell_pct),
+            tp_cooldown_days=int(tp_cooldown_days),
+            max_invested_usd=0.0,
+            max_position_value_usd=0.0
         )
         render_block(sum_bh, det_bh, label_prefix="Buy & Hold —", key_prefix=f"bh_{asset_key}")
 
@@ -873,21 +937,33 @@ else:
         mask = (ind_bench.index.day == 27) & (ind_bench.index.date > bench_anchor)
         base_sig_dca.loc[mask] = True
         sum_dca, det_dca = simulate_strategy(
-            ind=ind_bench, base_signal=base_sig_dca, buy_amount=250.0,
-            start_value_usd=2500.0, ref_price_usd=float(anchor_price),
-            fee_pct=float(fee_pct), slippage_pct=float(slippage_pct),
-            cooldown_days=0, trend_filter="None", use_rsi=False, rsi_max=float(rsi_max),
-            require_new_high_reset=False, max_signals_per_month=0, tp_use=False,
-            tp_basis="Average cost", tp_trigger_pct=float(tp_trigger_pct),
-            tp_sell_pct=float(tp_sell_pct), tp_cooldown_days=int(tp_cooldown_days),
-            max_invested_usd=0.0, max_position_value_usd=0.0
+            ind=ind_bench,
+            base_signal=base_sig_dca,
+            buy_amount=250.0,
+            start_value_usd=2500.0,
+            ref_price_usd=float(anchor_price),
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+            cooldown_days=0,
+            trend_filter="None",
+            use_rsi=False,
+            rsi_max=float(rsi_max),
+            require_new_high_reset=False,
+            max_signals_per_month=0,
+            tp_use=False,
+            tp_basis="Average cost",
+            tp_trigger_pct=float(tp_trigger_pct),
+            tp_sell_pct=float(tp_sell_pct),
+            tp_cooldown_days=int(tp_cooldown_days),
+            max_invested_usd=0.0,
+            max_position_value_usd=0.0
         )
         render_block(sum_dca, det_dca, label_prefix="Monthly DCA —", key_prefix=f"dca_{asset_key}")
 
 st.divider()
 
 # --------------------------
-# Multi-Asset Dashboard (same parameters across all)
+# Multi-Asset Dashboard (same parameters applied to all)
 # --------------------------
 st.header("🧪 Multi-Asset Dashboard (same parameters applied to all)")
 dash_tabs = st.tabs([ASSETS[k]["label"] for k in ASSETS.keys()])
@@ -901,7 +977,7 @@ def run_strategy_for_ticker(tkr: str):
         return None
     ii = compute_indicators(df, window_days=int(window_days), rsi_period=int(rsi_period), atr_period=int(DEFAULT_ATR_PERIOD))
     sig = compute_base_signals(ii, threshold_mode=threshold_mode, fixed_pct=float(threshold_pct), atr_mult=float(atr_mult))
-    # ref guess: start-date close for non-ETH, otherwise user input
+    # ref guess = start-date close for non-ETH (ETH uses user input)
     ref_guess = price_on_or_near(pd.DataFrame({"Close": ii["Close"]}), start_date)
     start_ref = float(ref_price_usd if tkr == "ETH-USD" else ref_guess if not pd.isna(ref_guess) else ref_price_usd)
     summ, det = simulate_strategy(
@@ -918,10 +994,10 @@ def run_strategy_for_ticker(tkr: str):
 
 compare_rows = []
 per_asset_results = {}
-for ti, tk in enumerate(ASSETS.keys()):
+for i, tk in enumerate(ASSETS.keys()):
     res = run_strategy_for_ticker(tk)
     label = ASSETS[tk]["label"]
-    with dash_tabs[ti]:
+    with dash_tabs[i]:
         if res is None:
             st.error(f"No data for {label} in the selected range.")
         else:
@@ -972,7 +1048,7 @@ st.divider()
 st.header("📈 Correlation & Beta (1y / 3y / 5y)")
 
 def load_close_series_for_all(end_dt: date, years: int):
-    start_dt = end_dt - timedelta(days=365*years + 14)  # buffer
+    start_dt = end_dt - timedelta(days=365*years + 14)  # a little buffer
     frames = {}
     for tk in ASSETS.keys():
         df = fetch_ohlc_yahoo_generic(tk, start_dt, end_dt) if ASSETS[tk]["kind"] != "crypto" \
