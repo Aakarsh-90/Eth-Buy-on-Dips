@@ -1,5 +1,3 @@
-# app.py — Buy-on-Dips Multi-Asset Dashboard with SIP + HYSA fallback
-
 import io
 import time
 import calendar
@@ -24,7 +22,7 @@ ASSETS = {
     "ETH-USD": {
         "label": "Ethereum (ETH-USD)",
         "kind": "crypto",
-        "symbols": ["ETH-USD"],  # kept for uniformity
+        "symbols": ["ETH-USD"],  # primary ticker for ETH
     },
     "GLD": {
         "label": "SPDR Gold Shares (GLD)",
@@ -446,8 +444,8 @@ def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
 def fetch_ohlc(start: date, end: date, source: str, asset_key: str):
     """
     Unified fetch with data-source fallback:
-    - ETH-USD: Coinbase → Kraken → Binance → Yahoo.
-    - GLD / ^SOX / ARTY: Yahoo on multiple symbols → Stooq on multiple symbols.
+    - ETH-USD: Coinbase -> Kraken -> Binance -> Yahoo.
+    - GLD / ^SOX / ARTY: Yahoo on multiple symbols -> Stooq on multiple symbols.
     """
     meta = ASSETS[asset_key]
     kind = meta["kind"]
@@ -500,7 +498,7 @@ def fetch_ohlc(start: date, end: date, source: str, asset_key: str):
                 return df, "ETH-USD"
         return pd.DataFrame(), None
 
-    # Non-crypto: ignore source, always try Yahoo on each symbol then Stooq
+    # Non-crypto: ignore 'source', always try Yahoo on each symbol then Stooq
     symbols = meta.get("symbols", [asset_key])
     for sym in symbols:
         df = fetch_ohlc_yahoo_generic(sym, start, end)
@@ -582,6 +580,40 @@ def compute_base_signals(
     return cond & (~cond.shift(1).fillna(False))
 
 
+def compute_sip_eligible_signals(
+    ind: pd.DataFrame,
+    threshold_mode: str,
+    fixed_pct: float,
+    atr_mult: float,
+    trend_filter: str,
+    use_rsi: bool,
+    rsi_max: float,
+) -> pd.Series:
+    if ind is None or ind.empty:
+        return pd.Series(dtype=bool)
+    thr_series = (
+        ind["ATR_Pct"] * atr_mult
+        if threshold_mode.startswith("ATR")
+        else pd.Series(fixed_pct, index=ind.index)
+    )
+    cond_dip = ind["DrawdownPct"] >= thr_series
+
+    if trend_filter == "Close > 200D SMA":
+        cond_trend = ind["Close"] > ind["SMA200"]
+    elif trend_filter == "50D SMA > 200D SMA":
+        cond_trend = ind["SMA50"] > ind["SMA200"]
+    else:
+        cond_trend = pd.Series(True, index=ind.index)
+
+    if use_rsi:
+        cond_rsi = ind["RSI"] <= float(rsi_max)
+    else:
+        cond_rsi = pd.Series(True, index=ind.index)
+
+    eligible = cond_dip & cond_trend & cond_rsi
+    return eligible.fillna(False)
+
+
 def robust_xirr(dates, amounts):
     if len(dates) != len(amounts) or len(dates) == 0:
         return np.nan
@@ -619,7 +651,7 @@ def robust_xirr(dates, amounts):
 
 
 # ----------------------------------------------------
-# SIMULATION
+# FULL STRATEGY SIM (SINGLE-ASSET PANEL)
 # ----------------------------------------------------
 def simulate_strategy(
     ind: pd.DataFrame,
@@ -840,6 +872,95 @@ def simulate_strategy(
 
 
 # ----------------------------------------------------
+# SIMPLE SIP BUY-AND-HOLD SIM (WEIGHTED BY DIP DEPTH)
+# ----------------------------------------------------
+def simulate_sip_buy_hold(
+    ind: pd.DataFrame,
+    month_signals: dict,
+    month_allocs: dict,
+    fee_pct: float,
+    slippage_pct: float,
+):
+    """
+    ind: indicators with Close column, indexed by datetime
+    month_signals: {(y,m): {'date': date, 'drawdown': float}}
+    month_allocs: {(y,m): amount_to_invest_pre_fee}
+    """
+    if ind is None or ind.empty:
+        return None, None
+
+    idx = ind.index
+    close = ind["Close"].to_numpy()
+    units = 0.0
+    portfolio_value = pd.Series(index=idx, dtype=float)
+
+    trades = []
+    cf_dates = []
+    cf_amounts = []
+
+    for i, dt in enumerate(idx):
+        ym = (dt.year, dt.month)
+        if ym in month_allocs and month_allocs[ym] > 0:
+            sig_info = month_signals.get(ym)
+            if sig_info is not None and sig_info["date"] == dt.date():
+                amount = float(month_allocs[ym])
+                exec_price = float(close[i]) * (1.0 + float(slippage_pct) / 100.0)
+                units_bought = amount / exec_price
+                fee_cash = amount * (float(fee_pct) / 100.0)
+                total_cash_out = amount + fee_cash
+
+                units += units_bought
+                trades.append(
+                    {
+                        "Type": "BUY",
+                        "Date": dt.date(),
+                        "Price_Close": float(close[i]),
+                        "Executed_Price": exec_price,
+                        "Units": units_bought,
+                        "USD_Spent_Excl_Fee": amount,
+                        "Fee_%": float(fee_pct),
+                        "Fee_Cash": fee_cash,
+                        "Total_Cash_Out": total_cash_out,
+                    }
+                )
+                cf_dates.append(dt.date())
+                cf_amounts.append(-total_cash_out)
+
+        portfolio_value.iloc[i] = units * close[i]
+
+    if len(idx) == 0:
+        return None, None
+
+    terminal_value = float(portfolio_value.iloc[-1])
+    cf_dates.append(idx[-1].date())
+    cf_amounts.append(terminal_value)
+
+    irr = robust_xirr(pd.to_datetime(cf_dates), cf_amounts)
+    total_invested = float(-sum(a for a in cf_amounts if a < 0))
+    abs_pnl = terminal_value - total_invested
+    pct_ret = (
+        (terminal_value / total_invested - 1.0) * 100.0 if total_invested > 0 else np.nan
+    )
+
+    summary = {
+        "final_units": float(units),
+        "terminal_value": terminal_value,
+        "total_invested": total_invested,
+        "absolute_pnl": abs_pnl,
+        "pct_return_on_invested": pct_ret,
+        "irr_xirr": irr,
+        "n_trades": len(trades),
+    }
+    details = {
+        "portfolio_value": portfolio_value,
+        "trades_df": pd.DataFrame(trades),
+        "cashflows": pd.DataFrame({"Date": cf_dates, "Amount": cf_amounts}),
+        "ind": ind,
+    }
+    return summary, details
+
+
+# ----------------------------------------------------
 # UI — SIDEBAR
 # ----------------------------------------------------
 st.sidebar.header("Backtest Period")
@@ -1053,7 +1174,7 @@ base_signal = compute_base_signals(
 if ASSETS[asset_key]["kind"] == "crypto":
     ref_for_this = ref_price_usd
 else:
-    ref_guess = price_on_or_near(ind[["Close"]].rename(columns={"Close": "Close"}), start_date)
+    ref_guess = price_on_or_near(ind[["Close"]], start_date)
     ref_for_this = ref_guess if not pd.isna(ref_guess) and ref_guess > 0 else ref_price_usd
 
 summary, details = simulate_strategy(
@@ -1205,7 +1326,10 @@ def run_strategy_for_asset_key(key: str):
     if df is None or df.empty:
         return None, None, None, None
     ii = compute_indicators(
-        df, window_days=int(window_days), rsi_period=int(rsi_period), atr_period=int(DEFAULT_ATR_PERIOD)
+        df,
+        window_days=int(window_days),
+        rsi_period=int(rsi_period),
+        atr_period=int(DEFAULT_ATR_PERIOD),
     )
     sig = compute_base_signals(
         ii,
@@ -1216,7 +1340,7 @@ def run_strategy_for_asset_key(key: str):
     if ASSETS[key]["kind"] == "crypto":
         ref = ref_price_usd
     else:
-        ref_guess = price_on_or_near(ii[["Close"]].rename(columns={"Close": "Close"}), start_date)
+        ref_guess = price_on_or_near(ii[["Close"]], start_date)
         ref = ref_guess if not pd.isna(ref_guess) and ref_guess > 0 else ref_price_usd
     summ, det = simulate_strategy(
         ind=ii,
@@ -1246,42 +1370,42 @@ compare_rows = []
 per_asset_results = {}
 
 for i, key in enumerate(ASSETS.keys()):
-    used_sym, ii, summ, det = run_strategy_for_asset_key(key)
+    used_sym_ma, ii_ma, summ_ma, det_ma = run_strategy_for_asset_key(key)
     with dash_tabs[i]:
         label = ASSETS[key]["label"]
-        if ii is None:
+        if ii_ma is None:
             st.error(
                 f"No data for {label} in the selected range (tried symbols: {', '.join(ASSETS[key].get('symbols', [key]))})."
             )
         else:
-            per_asset_results[key] = (used_sym, ii, summ, det)
+            per_asset_results[key] = (used_sym_ma, ii_ma, summ_ma, det_ma)
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades", f"{summ['n_trades']}")
-            c2.metric("Units (final)", f"{summ['final_units']:.6f}")
-            c3.metric("End value", format_usd(summ["terminal_value"]))
+            c1.metric("Trades", f"{summ_ma['n_trades']}")
+            c2.metric("Units (final)", f"{summ_ma['final_units']:.6f}")
+            c3.metric("End value", format_usd(summ_ma["terminal_value"]))
             c4.metric(
                 "XIRR",
-                f"{summ['irr_xirr']*100:.2f}%" if pd.notna(summ["irr_xirr"]) else "N/A",
+                f"{summ_ma['irr_xirr']*100:.2f}%" if pd.notna(summ_ma["irr_xirr"]) else "N/A",
             )
-            st.caption(f"Symbol used: **{used_sym}**")
+            st.caption(f"Symbol used: **{used_sym_ma}**")
 
             figd = plt.figure()
-            plt.plot(det["ind"].index, det["ind"]["Close"].values)
-            trd = det["trades_df"]
+            plt.plot(det_ma["ind"].index, det_ma["ind"]["Close"].values)
+            trd = det_ma["trades_df"]
             if not trd.empty:
                 bs = trd[trd["Type"] == "BUY"]
                 ss = trd[trd["Type"] == "SELL"]
                 if not bs.empty:
                     _b = pd.to_datetime(bs["Date"])
                     plt.scatter(
-                        _b, det["ind"]["Close"].loc[_b].values, marker="^"
+                        _b, det_ma["ind"]["Close"].loc[_b].values, marker="^"
                     )
                 if not ss.empty:
                     _s = pd.to_datetime(ss["Date"])
                     plt.scatter(
-                        _s, det["ind"]["Close"].loc[_s].values, marker="v"
+                        _s, det_ma["ind"]["Close"].loc[_s].values, marker="v"
                     )
-            plt.title(f"{used_sym} — Close with Buys (^) / Sells (v)")
+            plt.title(f"{used_sym_ma} — Close with Buys (^) / Sells (v)")
             plt.xlabel("Date")
             plt.ylabel("Price (USD)")
             st.pyplot(figd, use_container_width=True)
@@ -1289,19 +1413,19 @@ for i, key in enumerate(ASSETS.keys()):
             compare_rows.append(
                 {
                     "AssetKey": key,
-                    "UsedSymbol": used_sym,
-                    "Trades": int(summ["n_trades"]),
-                    "Units Final": float(summ["final_units"]),
-                    "Terminal Value (USD)": float(summ["terminal_value"]),
-                    "Total Invested (USD)": float(summ["total_invested"]),
-                    "Abs P&L (USD)": float(summ["absolute_pnl"]),
+                    "UsedSymbol": used_sym_ma,
+                    "Trades": int(summ_ma["n_trades"]),
+                    "Units Final": float(summ_ma["final_units"]),
+                    "Terminal Value (USD)": float(summ_ma["terminal_value"]),
+                    "Total Invested (USD)": float(summ_ma["total_invested"]),
+                    "Abs P&L (USD)": float(summ_ma["absolute_pnl"]),
                     "P&L % on Invested": float(
-                        summ["pct_return_on_invested"]
+                        summ_ma["pct_return_on_invested"]
                     )
-                    if pd.notna(summ["pct_return_on_invested"])
+                    if pd.notna(summ_ma["pct_return_on_invested"])
                     else np.nan,
-                    "XIRR": float(summ["irr_xirr"])
-                    if pd.notna(summ["irr_xirr"])
+                    "XIRR": float(summ_ma["irr_xirr"])
+                    if pd.notna(summ_ma["irr_xirr"])
                     else np.nan,
                 }
             )
@@ -1321,164 +1445,195 @@ if compare_rows:
 st.divider()
 
 # ----------------------------------------------------
-# MONTHLY SIP + HYSA FALLBACK
+# MONTHLY SIP + HYSA FALLBACK (WEIGHTED BY DIP DEPTH)
 # ----------------------------------------------------
-st.header("💸 Monthly SIP with HYSA fallback")
+st.header("💸 Monthly SIP with HYSA fallback (weighted by dip depth)")
 
 if monthly_sip_budget > 0:
-    n_assets = len(ASSETS)
-    per_asset_sip = monthly_sip_budget / float(n_assets) if n_assets > 0 else 0.0
     months_list = generate_month_list(start_date, end_date)
+    base_slice = monthly_sip_budget / float(len(ASSETS)) if len(ASSETS) > 0 else 0.0
 
-    sip_results = {}
-    asset_buy_months = {k: set() for k in ASSETS.keys()}
-
-    # Run SIP-style strategy: start at 0, max 1 buy / asset / month, buy_amount = per_asset_sip
+    # First pass: for each asset, compute indicators & SIP-eligible signals and month-level best dip
+    sip_asset_info = {}
     for key in ASSETS.keys():
-        df, used_sym = fetch_ohlc(start_date, end_date, data_source, key)
-        df = _finalize_ohlc(df, start_date, end_date)
-        if df is None or df.empty:
+        df_sip, used_sym_sip = fetch_ohlc(start_date, end_date, data_source, key)
+        df_sip = _finalize_ohlc(df_sip, start_date, end_date)
+        if df_sip is None or df_sip.empty:
             continue
-        ii = compute_indicators(
-            df,
+        ind_sip = compute_indicators(
+            df_sip,
             window_days=int(window_days),
             rsi_period=int(rsi_period),
             atr_period=int(DEFAULT_ATR_PERIOD),
         )
-        sig = compute_base_signals(
-            ii,
+        eligible = compute_sip_eligible_signals(
+            ind_sip,
             threshold_mode=threshold_mode,
             fixed_pct=float(threshold_pct),
             atr_mult=float(atr_mult),
-        )
-
-        # Reference price for starting units (we start at 0, but ref is used internally)
-        if ASSETS[key]["kind"] == "crypto":
-            ref_guess = ref_price_usd
-        else:
-            ref_guess = price_on_or_near(
-                ii[["Close"]].rename(columns={"Close": "Close"}), start_date
-            )
-            if pd.isna(ref_guess) or ref_guess <= 0:
-                ref_guess = ref_price_usd
-
-        summ_sip, det_sip = simulate_strategy(
-            ind=ii,
-            base_signal=sig,
-            buy_amount=float(per_asset_sip),
-            start_value_usd=0.0,  # SIP-only portfolio
-            ref_price_usd=float(ref_guess),
-            fee_pct=float(fee_pct),
-            slippage_pct=float(slippage_pct),
-            cooldown_days=int(cooldown_days),
             trend_filter=trend_filter,
             use_rsi=bool(use_rsi),
             rsi_max=float(rsi_max),
-            require_new_high_reset=bool(require_new_high_reset),
-            max_signals_per_month=1,  # <=1 buy per asset per month
-            tp_use=bool(tp_use),
-            tp_basis=str(tp_basis),
-            tp_trigger_pct=float(tp_trigger_pct),
-            tp_sell_pct=float(tp_sell_pct),
-            tp_cooldown_days=int(tp_cooldown_days),
-            max_invested_usd=0.0 if max_invested_usd == 0 else float(max_invested_usd),
-            max_position_value_usd=0.0
-            if max_position_value_usd == 0
-            else float(max_position_value_usd),
         )
+        # Build month_signals: pick the day with max drawdown in each month where eligible is True
+        month_signals = {}
+        for (y, m) in months_list:
+            mask = (ind_sip.index.year == y) & (ind_sip.index.month == m)
+            month_df = ind_sip.loc[mask]
+            if month_df.empty:
+                continue
+            elig_month = eligible.loc[month_df.index]
+            if not elig_month.any():
+                continue
+            sub = month_df[elig_month]
+            best_idx = sub["DrawdownPct"].idxmax()
+            best_dd = float(sub.loc[best_idx, "DrawdownPct"])
+            month_signals[(y, m)] = {"date": best_idx.date(), "drawdown": best_dd}
 
-        sip_results[key] = (used_sym, summ_sip, det_sip)
+        sip_asset_info[key] = {
+            "used_symbol": used_sym_sip,
+            "ind": ind_sip,
+            "month_signals": month_signals,
+        }
 
-        tr = det_sip["trades_df"]
-        if not tr.empty:
-            buys = tr[tr["Type"] == "BUY"]
-            for d in pd.to_datetime(buys["Date"]).dt.date:
-                asset_buy_months[key].add((d.year, d.month))
-
-    # HYSA flows: unused slices each month
+    # Second pass: allocate monthly SIP across assets based on dip depth
+    allocations = {k: {} for k in ASSETS.keys()}  # allocations[asset][(y,m)] = amount
     hysa_contrib_rows = []
-    balance = 0.0
-    hysa_cashflow_dates = []
-    hysa_cashflow_amounts = []
+    hysa_balance = 0.0
+    hysa_cf_dates = []
+    hysa_cf_amounts = []
     monthly_rate = (hysa_apy / 100.0) / 12.0 if hysa_apy > 0 else 0.0
 
     for (y, m) in months_list:
+        # collect assets with a signal in this month
+        active_assets = []
+        weights = []
+        for key, info in sip_asset_info.items():
+            ms = info["month_signals"]
+            if (y, m) in ms:
+                dd = ms[(y, m)]["drawdown"]
+                if dd is not None and not np.isnan(dd) and dd > 0:
+                    active_assets.append(key)
+                    weights.append(dd)
+
+        num_signals = len(active_assets)
+        if num_signals == 0:
+            invested_this_month = 0.0
+        else:
+            total_invested_month = base_slice * num_signals
+            invested_this_month = total_invested_month
+            # weight within that pool by dip depth
+            w_sum = float(sum(weights))
+            if w_sum <= 0:
+                # fallback: equal split among active
+                equal_alloc = total_invested_month / float(num_signals)
+                for key in active_assets:
+                    allocations[key][(y, m)] = equal_alloc
+            else:
+                for key, w in zip(active_assets, weights):
+                    alloc = total_invested_month * (float(w) / w_sum)
+                    allocations[key][(y, m)] = alloc
+
+        # HYSA gets leftover (if any)
+        hysa_contrib = monthly_sip_budget - invested_this_month
+        if hysa_contrib < 0:
+            hysa_contrib = 0.0  # safety clamp
+
         month_end_dt = month_end(y, m)
         if month_end_dt < start_date or month_end_dt > end_date:
             continue
-        invested_this_month = 0.0
-        for key in ASSETS.keys():
-            if (y, m) in asset_buy_months[key]:
-                invested_this_month += per_asset_sip
-        hysa_contrib = monthly_sip_budget - invested_this_month
-        if hysa_contrib < 0:
-            hysa_contrib = 0.0  # should not happen, but safety
 
         if hysa_contrib > 0:
-            balance += hysa_contrib
-            hysa_cashflow_dates.append(month_end_dt)
-            hysa_cashflow_amounts.append(-hysa_contrib)
+            hysa_balance += hysa_contrib
+            hysa_cf_dates.append(month_end_dt)
+            hysa_cf_amounts.append(-hysa_contrib)
 
-        if monthly_rate > 0 and balance > 0:
-            interest = balance * monthly_rate
-            balance += interest
+        if monthly_rate > 0 and hysa_balance > 0:
+            interest = hysa_balance * monthly_rate
+            hysa_balance += interest
 
         hysa_contrib_rows.append(
             {
                 "MonthEnd": month_end_dt,
                 "Invested Into Assets": invested_this_month,
                 "HYSA Contribution": hysa_contrib,
-                "HYSA Balance": balance,
+                "HYSA Balance": hysa_balance,
             }
         )
 
-    if balance > 0:
-        hysa_cashflow_dates.append(end_date)
-        hysa_cashflow_amounts.append(balance)
+    if hysa_balance > 0:
+        hysa_cf_dates.append(end_date)
+        hysa_cf_amounts.append(hysa_balance)
 
     hysa_irr = (
-        robust_xirr(pd.to_datetime(hysa_cashflow_dates), hysa_cashflow_amounts)
-        if hysa_cashflow_dates
+        robust_xirr(pd.to_datetime(hysa_cf_dates), hysa_cf_amounts)
+        if hysa_cf_dates
         else np.nan
     )
-    total_hysa_invested = float(-sum(a for a in hysa_cashflow_amounts if a < 0))
+    total_hysa_invested = float(-sum(a for a in hysa_cf_amounts if a < 0))
     hysa_abs_pnl = (
-        balance - total_hysa_invested if total_hysa_invested > 0 else 0.0
+        hysa_balance - total_hysa_invested if total_hysa_invested > 0 else 0.0
     )
 
-    # SIP summary table
-    rows = []
-    for key in ASSETS.keys():
-        if key in sip_results:
-            used_sym, summ_sip, det_sip = sip_results[key]
-            rows.append(
+    # Third pass: run SIP buy-hold simulation per asset using month-level allocations
+    sip_rows = []
+    for key, info in sip_asset_info.items():
+        ind_sip = info["ind"]
+        month_signals = info["month_signals"]
+        month_allocs = allocations.get(key, {})
+        # skip if no allocation
+        if not month_allocs:
+            sip_rows.append(
                 {
                     "Asset": key,
-                    "Symbol": used_sym,
-                    "Total Invested (USD)": summ_sip["total_invested"],
-                    "Terminal Value (USD)": summ_sip["terminal_value"],
-                    "Abs P&L (USD)": summ_sip["absolute_pnl"],
-                    "P&L % on Invested": summ_sip["pct_return_on_invested"],
-                    "XIRR": summ_sip["irr_xirr"],
-                    "Trades": summ_sip["n_trades"],
+                    "Symbol": info["used_symbol"],
+                    "Total Invested (USD)": 0.0,
+                    "Terminal Value (USD)": 0.0,
+                    "Abs P&L (USD)": 0.0,
+                    "P&L % on Invested": np.nan,
+                    "XIRR": np.nan,
+                    "Trades": 0,
                 }
             )
-    rows.append(
+            continue
+        summ_sip, det_sip = simulate_sip_buy_hold(
+            ind_sip,
+            month_signals=month_signals,
+            month_allocs=month_allocs,
+            fee_pct=float(fee_pct),
+            slippage_pct=float(slippage_pct),
+        )
+        sip_rows.append(
+            {
+                "Asset": key,
+                "Symbol": info["used_symbol"],
+                "Total Invested (USD)": summ_sip["total_invested"],
+                "Terminal Value (USD)": summ_sip["terminal_value"],
+                "Abs P&L (USD)": summ_sip["absolute_pnl"],
+                "P&L % on Invested": summ_sip["pct_return_on_invested"],
+                "XIRR": summ_sip["irr_xirr"],
+                "Trades": summ_sip["n_trades"],
+            }
+        )
+
+    # add HYSA row
+    sip_rows.append(
         {
             "Asset": "HYSA",
             "Symbol": "HYSA",
             "Total Invested (USD)": total_hysa_invested,
-            "Terminal Value (USD)": balance,
+            "Terminal Value (USD)": hysa_balance,
             "Abs P&L (USD)": hysa_abs_pnl,
-            "P&L % on Invested": (balance / total_hysa_invested - 1.0) * 100.0
+            "P&L % on Invested": (hysa_balance / total_hysa_invested - 1.0) * 100.0
             if total_hysa_invested > 0
             else np.nan,
             "XIRR": hysa_irr,
             "Trades": 0,
         }
     )
-    sip_cmp_df = pd.DataFrame(rows)
-    st.subheader("SIP + HYSA comparison")
+
+    sip_cmp_df = pd.DataFrame(sip_rows)
+    st.subheader("SIP + HYSA comparison (weighted by dip depth)")
     st.dataframe(
         sip_cmp_df.style.format(
             {
@@ -1494,7 +1649,7 @@ if monthly_sip_budget > 0:
     st.download_button(
         "Download SIP + HYSA comparison (CSV)",
         data=sip_cmp_df.to_csv(index=False),
-        file_name="sip_hysa_comparison.csv",
+        file_name="sip_hysa_comparison_weighted.csv",
         mime="text/csv",
         key="dl_sip_hysa_cmp",
     )
@@ -1543,7 +1698,7 @@ def corr_beta_tables(end_dt: date, years: int):
     corr = rets.corr()
     cov = rets.cov()
     var = np.diag(cov.values)
-    beta = pd.DataFrame(index	cov.index, columns=cov.columns, dtype=float)
+    beta = pd.DataFrame(index=cov.index, columns=cov.columns, dtype=float)
     for i in cov.index:
         for j_idx, j in enumerate(cov.columns):
             denom = var[j_idx]
@@ -1558,7 +1713,7 @@ for years in [1, 3, 5]:
     else:
         st.caption(
             "Symbols used: "
-            + ", ".join([f"{k}→{v}" for k, v in used_map.items() if v])
+            + ", ".join([f"{k}->{v}" for k, v in used_map.items() if v])
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -1572,7 +1727,7 @@ for years in [1, 3, 5]:
                 key=f"dl_corr_{years}",
             )
         with c2:
-            st.markdown("**Beta matrix βᵢ⟂ⱼ (daily returns)**")
+            st.markdown("**Beta matrix β(row) vs β(column)**")
             st.caption(
                 "β of row asset i with respect to column asset j (Cov(i,j)/Var(j))."
             )
@@ -1595,12 +1750,13 @@ st.markdown(
 - Take-profit: when price ≥ basis × (1 + TP%), sell % with cooldown.
 - Caps: skip if total invested or position value would exceed caps.
 - Data:
-  - ETH-USD: Coinbase → Kraken → Binance → Yahoo Finance fallback.
-  - GLD / ^SOX / ARTY: Yahoo Finance on multiple tickers → Stooq (.us) CSV fallback.
-- Multi-asset SIP:
-  - Monthly SIP = slider (default $1,000).
-  - Each asset gets SIP/4 slice (e.g., $250) if it fires at least one BUY that month (with all your filters).
-  - Unused slices go to HYSA, which compounds monthly at the chosen APY.
+  - ETH-USD: Coinbase -> Kraken -> Binance -> Yahoo Finance fallback.
+  - GLD / ^SOX / ARTY: Yahoo Finance on multiple tickers -> Stooq (.us) CSV fallback.
+- Multi-asset SIP (weighted by dip depth):
+  - Each month: base slice = SIP/4 per asset.
+  - Assets that meet dip+filter criteria form the eligible set; total invested that month = base_slice × #eligible.
+  - That pool is split across eligible assets proportional to their drawdown on the chosen signal day (deeper dips ⇒ bigger weight).
+  - The unused portion of the SIP (if any) goes to HYSA, which compounds monthly at the chosen APY.
 - Correlation/Beta: daily pct-change returns; βᵢ⟂ⱼ = Cov(i,j)/Var(j) (row vs column).
 """
 )
