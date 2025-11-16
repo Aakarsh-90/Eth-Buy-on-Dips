@@ -2,6 +2,7 @@ import io
 import time
 import calendar
 from datetime import date, timedelta
+from typing import Dict, Tuple, Optional, List, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,7 +19,7 @@ st.set_page_config(page_title="Buy-the-Dip (Multi-Asset)", layout="wide")
 # ----------------------------------------------------
 # ASSET CONFIG
 # ----------------------------------------------------
-ASSETS = {
+ASSETS: Dict[str, Dict[str, Any]] = {
     "ETH-USD": {
         "label": "Ethereum (ETH-USD)",
         "kind": "crypto",
@@ -77,14 +78,14 @@ DEFAULT_TP_COOLDOWN_DAYS = 7
 DEFAULT_MAX_INVESTED_USD = 0.0
 DEFAULT_MAX_POSITION_VALUE_USD = 0.0
 
-if "last_loader_error" not in st.session_state:
-    st.session_state.last_loader_error = ""
+if "loader_errors" not in st.session_state:
+    st.session_state.loader_errors: List[str] = []
 
 
 # ----------------------------------------------------
 # HELPERS
 # ----------------------------------------------------
-def _std_headers():
+def _std_headers() -> Dict[str, str]:
     return {
         "User-Agent": "Mozilla/5.0 (MultiAssetDipApp)",
         "Accept": "application/json",
@@ -93,9 +94,14 @@ def _std_headers():
     }
 
 
+def _log_loader_error(msg: str) -> None:
+    st.session_state.loader_errors.append(msg)
+
+
 def _finalize_ohlc(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+    df = df.copy()
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df.sort_index()
     df = df.loc[(df.index.date >= start) & (df.index.date <= end)]
@@ -114,7 +120,7 @@ def _flatten_multiindex_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def format_usd(x):
+def format_usd(x: Any) -> str:
     try:
         return f"${x:,.2f}"
     except Exception:
@@ -131,9 +137,9 @@ def price_on_or_near(ind_df: pd.DataFrame, anchor: date) -> float:
     return float(ind_df.iloc[pos]["Close"])
 
 
-def generate_month_list(start_dt: date, end_dt: date):
+def generate_month_list(start_dt: date, end_dt: date) -> List[Tuple[int, int]]:
     """List of (year, month) from start_dt..end_dt inclusive."""
-    months = []
+    months: List[Tuple[int, int]] = []
     cur = date(start_dt.year, start_dt.month, 1)
     while cur <= end_dt:
         months.append((cur.year, cur.month))
@@ -153,7 +159,7 @@ def month_end(y: int, m: int) -> date:
 # SPOT PRICES
 # ----------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_spot_eth_usd():
+def fetch_spot_eth_usd() -> Tuple[float, str]:
     try:
         r = requests.get(
             "https://api.coinbase.com/v2/prices/ETH-USD/spot",
@@ -162,7 +168,8 @@ def fetch_spot_eth_usd():
         )
         r.raise_for_status()
         return float(r.json()["data"]["amount"]), "Coinbase"
-    except Exception:
+    except Exception as e:
+        _log_loader_error(f"Spot ETH Coinbase error: {e}")
         try:
             r = requests.get(
                 "https://api.coingecko.com/api/v3/simple/price",
@@ -172,25 +179,28 @@ def fetch_spot_eth_usd():
             )
             r.raise_for_status()
             return float(r.json()["ethereum"]["usd"]), "CoinGecko"
-        except Exception:
+        except Exception as e2:
+            _log_loader_error(f"Spot ETH CoinGecko error: {e2}")
             return np.nan, "—"
 
 
 @st.cache_data(show_spinner=False, ttl=60)
-def fetch_spot_yahoo_close(symbol: str):
+def fetch_spot_yahoo_close(symbol: str) -> Tuple[float, str]:
     try:
         df = yf.download(symbol, period="5d", interval="1d", progress=False)
         if df is None or df.empty:
+            _log_loader_error(f"Spot Yahoo empty for {symbol}")
             return np.nan, "—"
         return float(df["Close"].dropna().iloc[-1]), "Yahoo"
-    except Exception:
+    except Exception as e:
+        _log_loader_error(f"Spot Yahoo error for {symbol}: {e}")
         return np.nan, "—"
 
 
 # ----------------------------------------------------
 # DATA LOADERS
 # ----------------------------------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_ohlc_yahoo_generic(symbol: str, start: date, end: date) -> pd.DataFrame:
     try:
         df = yf.download(
@@ -205,7 +215,7 @@ def fetch_ohlc_yahoo_generic(symbol: str, start: date, end: date) -> pd.DataFram
             return pd.DataFrame()
         df = _flatten_multiindex_columns(df)
 
-        def pick_col(name: str):
+        def pick_col(name: str) -> pd.Series:
             if name in df.columns:
                 return df[name]
             cands = [
@@ -213,7 +223,11 @@ def fetch_ohlc_yahoo_generic(symbol: str, start: date, end: date) -> pd.DataFram
                 for c in df.columns
                 if c.split("_")[-1] == name or c.split(" ")[-1] == name
             ]
-            return df[cands[0]] if cands else pd.Series(index=df.index, dtype="float64")
+            return (
+                df[cands[0]]
+                if cands
+                else pd.Series(index=df.index, dtype="float64", name=name)
+            )
 
         out = pd.DataFrame(
             {
@@ -224,11 +238,11 @@ def fetch_ohlc_yahoo_generic(symbol: str, start: date, end: date) -> pd.DataFram
         )
         return _finalize_ohlc(out, start, end)
     except Exception as e:
-        st.session_state.last_loader_error = f"Yahoo fatal: {e!s}"
+        _log_loader_error(f"Yahoo fatal for {symbol}: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_ohlc_stooq(symbol: str, start: date, end: date) -> pd.DataFrame:
     """
     Simple free fallback using Stooq CSV:
@@ -246,7 +260,6 @@ def fetch_ohlc_stooq(symbol: str, start: date, end: date) -> pd.DataFrame:
             return pd.DataFrame()
         df["Date"] = pd.to_datetime(df["Date"])
         df.set_index("Date", inplace=True)
-        # Standard Stooq names: Open, High, Low, Close, Volume
         rename_map = {}
         for c in df.columns:
             cl = c.lower()
@@ -259,26 +272,28 @@ def fetch_ohlc_stooq(symbol: str, start: date, end: date) -> pd.DataFrame:
         df = df.rename(columns=rename_map)
         return _finalize_ohlc(df, start, end)
     except Exception as e:
-        st.session_state.last_loader_error = f"Stooq error for {symbol}: {e!s}"
+        _log_loader_error(f"Stooq error for {symbol}: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
     try:
         s = pd.Timestamp(start, tz="UTC")
         e = pd.Timestamp(end + timedelta(days=1), tz="UTC")
         step = pd.Timedelta(days=200)
-        frames, cur = [], s
+        frames: List[pd.DataFrame] = []
+        cur = s
         while cur < e:
             chunk_end = min(cur + step, e)
+            params = {
+                "granularity": 86400,
+                "start": cur.isoformat(),
+                "end": chunk_end.isoformat(),
+            }
             r = requests.get(
                 "https://api.exchange.coinbase.com/products/ETH-USD/candles",
-                params={
-                    "granularity": 86400,
-                    "start": cur.isoformat(),
-                    "end": chunk_end.isoformat(),
-                },
+                params=params,
                 timeout=30,
                 headers=_std_headers(),
             )
@@ -286,11 +301,7 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
                 time.sleep(1.0)
                 r = requests.get(
                     "https://api.exchange.coinbase.com/products/ETH-USD/candles",
-                    params={
-                        "granularity": 86400,
-                        "start": cur.isoformat(),
-                        "end": chunk_end.isoformat(),
-                    },
+                    params=params,
                     timeout=30,
                     headers=_std_headers(),
                 )
@@ -319,16 +330,17 @@ def fetch_ohlc_coinbase(start: date, end: date) -> pd.DataFrame:
         out = pd.concat(frames).sort_index()
         return _finalize_ohlc(out, start, end)
     except Exception as e:
-        st.session_state.last_loader_error = f"Coinbase error: {e!s}"
+        _log_loader_error(f"Coinbase error: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
     try:
         start_ts = int(pd.Timestamp(start).timestamp() * 1000)
         end_ts = int((pd.Timestamp(end) + pd.Timedelta(days=1)).timestamp() * 1000)
-        frames, cur = [], start_ts
+        frames: List[pd.DataFrame] = []
+        cur = start_ts
         while cur < end_ts:
             r = requests.get(
                 "https://api.binance.com/api/v3/klines",
@@ -364,7 +376,8 @@ def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
                 ],
             )
             df["ts"] = (
-                pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(None)
+                pd.to_datetime(df["open_time"], unit="ms", utc=True)
+                .dt.tz_convert(None)
             )
             df.set_index("ts", inplace=True)
             df = df[["high", "low", "close"]].astype(float)
@@ -379,14 +392,14 @@ def fetch_ohlc_binance(start: date, end: date) -> pd.DataFrame:
         out = pd.concat(frames).sort_index()
         return _finalize_ohlc(out, start, end)
     except Exception as e:
-        st.session_state.last_loader_error = f"Binance error: {e!s}"
+        _log_loader_error(f"Binance error: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
     try:
-        frames = []
+        frames: List[pd.DataFrame] = []
         cur = int(pd.Timestamp(start).timestamp())
         end_sec = int(pd.Timestamp(end + timedelta(days=1)).timestamp())
         while cur < end_sec:
@@ -437,11 +450,13 @@ def fetch_ohlc_kraken(start: date, end: date) -> pd.DataFrame:
         out = pd.concat(frames).sort_index()
         return _finalize_ohlc(out, start, end)
     except Exception as e:
-        st.session_state.last_loader_error = f"Kraken error: {e!s}"
+        _log_loader_error(f"Kraken error: {e}")
         return pd.DataFrame()
 
 
-def fetch_ohlc(start: date, end: date, source: str, asset_key: str):
+def fetch_ohlc(
+    start: date, end: date, source: str, asset_key: str
+) -> Tuple[pd.DataFrame, Optional[str]]:
     """
     Unified fetch with data-source fallback:
     - ETH-USD: Coinbase -> Kraken -> Binance -> Yahoo.
@@ -516,16 +531,18 @@ def fetch_ohlc(start: date, end: date, source: str, asset_key: str):
 # ----------------------------------------------------
 def compute_indicators(
     ohlc: pd.DataFrame, window_days: int, rsi_period: int, atr_period: int
-):
+) -> pd.DataFrame:
     if ohlc is None or ohlc.empty:
         return pd.DataFrame()
 
+    ohlc = ohlc.copy()
     close = pd.to_numeric(ohlc["Close"], errors="coerce")
     high = pd.to_numeric(ohlc["High"], errors="coerce")
     low = pd.to_numeric(ohlc["Low"], errors="coerce")
 
     roll_max = close.rolling(window=window_days, min_periods=1).max()
 
+    # RSI
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
@@ -534,6 +551,7 @@ def compute_indicators(
     rs = roll_up / roll_down.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
 
+    # ATR
     prev_close = close.shift(1)
     tr = pd.concat(
         [
@@ -571,6 +589,9 @@ def compute_indicators(
 def compute_base_signals(
     ind: pd.DataFrame, threshold_mode: str, fixed_pct: float, atr_mult: float
 ) -> pd.Series:
+    if ind is None or ind.empty:
+        return pd.Series(dtype=bool)
+
     thr_series = (
         ind["ATR_Pct"] * atr_mult
         if threshold_mode.startswith("ATR")
@@ -614,10 +635,11 @@ def compute_sip_eligible_signals(
     return eligible.fillna(False)
 
 
-def robust_xirr(dates, amounts):
+def robust_xirr(dates: List[date], amounts: List[float]) -> float:
     if len(dates) != len(amounts) or len(dates) == 0:
         return np.nan
-    dfcf = pd.DataFrame({"date": pd.to_datetime(dates).date, "amt": amounts})
+    dt_idx = pd.to_datetime(dates)
+    dfcf = pd.DataFrame({"date": dt_idx.date, "amt": amounts})
     dfcf = dfcf.groupby("date", as_index=False)["amt"].sum().sort_values("date")
     amts = dfcf["amt"].to_numpy(dtype=float)
     dts = pd.to_datetime(dfcf["date"])
@@ -626,8 +648,8 @@ def robust_xirr(dates, amounts):
     t0 = dts.iloc[0]
     years = (dts - t0).dt.days.to_numpy(dtype=float) / 365.0
 
-    def npv(r):
-        return np.sum(amts / (1.0 + r) ** years)
+    def npv(r: float) -> float:
+        return float(np.sum(amts / (1.0 + r) ** years))
 
     lo, hi = -0.999, 10.0
     f_lo, f_hi = npv(lo), npv(hi)
@@ -674,7 +696,7 @@ def simulate_strategy(
     tp_cooldown_days: int = 7,
     max_invested_usd: float = 0.0,
     max_position_value_usd: float = 0.0,
-):
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     idx = ind.index
     if not isinstance(base_signal, pd.Series):
         base_signal = pd.Series(base_signal, index=idx)
@@ -690,19 +712,19 @@ def simulate_strategy(
     current_units = start_value_usd / ref_price_usd if ref_price_usd > 0 else 0.0
     total_cost_excl_fees = start_value_usd
     last_buy_price = ref_price_usd
-    last_buy_date = None
-    last_tp_date = None
-    last_signal_rollmax_at_buy = None
-    month_counts = {}
+    last_buy_date: Optional[date] = None
+    last_tp_date: Optional[date] = None
+    last_signal_rollmax_at_buy: Optional[float] = None
+    month_counts: Dict[Tuple[int, int], int] = {}
 
-    cashflows_dates = [idx[0].date()]
-    cashflows_amounts = [-float(start_value_usd)]
-    trades = []
+    cashflows_dates: List[date] = [idx[0].date()]
+    cashflows_amounts: List[float] = [-float(start_value_usd)]
+    trades: List[Dict[str, Any]] = []
 
     units_series = pd.Series(index=idx, dtype=float)
     cost_basis_series = pd.Series(index=idx, dtype=float)
 
-    def avg_cost_per_unit():
+    def avg_cost_per_unit() -> float:
         return total_cost_excl_fees / current_units if current_units > 0 else np.nan
 
     for i, dt in enumerate(idx):
@@ -847,9 +869,9 @@ def simulate_strategy(
     cashflows_dates.append(idx[-1].date())
     cashflows_amounts.append(terminal_value)
 
-    irr = robust_xirr(pd.to_datetime(cashflows_dates), cashflows_amounts)
+    irr = robust_xirr(cashflows_dates, cashflows_amounts)
     total_invested = float(-sum(a for a in cashflows_amounts if a < 0))
-    summary = {
+    summary: Dict[str, Any] = {
         "final_units": float(ind["Units"].iloc[-1]),
         "terminal_value": float(terminal_value),
         "total_invested": total_invested,
@@ -862,7 +884,7 @@ def simulate_strategy(
         if total_invested > 0
         else np.nan,
     }
-    details = {
+    details: Dict[str, Any] = {
         "portfolio_value": portfolio_value,
         "trades_df": pd.DataFrame(trades),
         "cashflows": pd.DataFrame({"Date": cashflows_dates, "Amount": cashflows_amounts}),
@@ -876,27 +898,43 @@ def simulate_strategy(
 # ----------------------------------------------------
 def simulate_sip_buy_hold(
     ind: pd.DataFrame,
-    month_signals: dict,
-    month_allocs: dict,
+    month_signals: Dict[Tuple[int, int], Dict[str, Any]],
+    month_allocs: Dict[Tuple[int, int], float],
     fee_pct: float,
     slippage_pct: float,
-):
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     ind: indicators with Close column, indexed by datetime
     month_signals: {(y,m): {'date': date, 'drawdown': float}}
     month_allocs: {(y,m): amount_to_invest_pre_fee}
     """
     if ind is None or ind.empty:
-        return None, None
+        return (
+            {
+                "final_units": 0.0,
+                "terminal_value": 0.0,
+                "total_invested": 0.0,
+                "absolute_pnl": 0.0,
+                "pct_return_on_invested": np.nan,
+                "irr_xirr": np.nan,
+                "n_trades": 0,
+            },
+            {
+                "portfolio_value": pd.Series(dtype=float),
+                "trades_df": pd.DataFrame(),
+                "cashflows": pd.DataFrame(columns=["Date", "Amount"]),
+                "ind": ind,
+            },
+        )
 
     idx = ind.index
     close = ind["Close"].to_numpy()
     units = 0.0
     portfolio_value = pd.Series(index=idx, dtype=float)
 
-    trades = []
-    cf_dates = []
-    cf_amounts = []
+    trades: List[Dict[str, Any]] = []
+    cf_dates: List[date] = []
+    cf_amounts: List[float] = []
 
     for i, dt in enumerate(idx):
         ym = (dt.year, dt.month)
@@ -929,13 +967,29 @@ def simulate_sip_buy_hold(
         portfolio_value.iloc[i] = units * close[i]
 
     if len(idx) == 0:
-        return None, None
+        return (
+            {
+                "final_units": 0.0,
+                "terminal_value": 0.0,
+                "total_invested": 0.0,
+                "absolute_pnl": 0.0,
+                "pct_return_on_invested": np.nan,
+                "irr_xirr": np.nan,
+                "n_trades": 0,
+            },
+            {
+                "portfolio_value": portfolio_value,
+                "trades_df": pd.DataFrame(trades),
+                "cashflows": pd.DataFrame(columns=["Date", "Amount"]),
+                "ind": ind,
+            },
+        )
 
     terminal_value = float(portfolio_value.iloc[-1])
     cf_dates.append(idx[-1].date())
     cf_amounts.append(terminal_value)
 
-    irr = robust_xirr(pd.to_datetime(cf_dates), cf_amounts)
+    irr = robust_xirr(cf_dates, cf_amounts)
     total_invested = float(-sum(a for a in cf_amounts if a < 0))
     abs_pnl = terminal_value - total_invested
     pct_ret = (
@@ -961,6 +1015,43 @@ def simulate_sip_buy_hold(
 
 
 # ----------------------------------------------------
+# CORR / BETA HELPERS
+# ----------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_close_series_for_all(end_dt: date, years: int, data_source: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    start_dt = end_dt - timedelta(days=365 * years + 14)
+    frames: Dict[str, pd.Series] = {}
+    symbols_used: Dict[str, str] = {}
+    for key in ASSETS.keys():
+        df, used = fetch_ohlc(start_dt, end_dt, data_source, key)
+        df = _finalize_ohlc(df, start_dt, end_dt)
+        if df is None or df.empty:
+            continue
+        frames[key] = df["Close"].rename(key)
+        symbols_used[key] = used or key
+    if not frames:
+        return pd.DataFrame(), {}
+    allc = pd.concat(frames.values(), axis=1).dropna(how="any")
+    return allc, symbols_used
+
+
+def corr_beta_tables(end_dt: date, years: int, data_source: str):
+    closes, sym_used = load_close_series_for_all(end_dt, years, data_source)
+    if closes.empty or len(closes) < 30:
+        return None, None, sym_used
+    rets = closes.pct_change().dropna(how="any")
+    corr = rets.corr()
+    cov = rets.cov()
+    var = np.diag(cov.values)
+    beta = pd.DataFrame(index=cov.index, columns=cov.columns, dtype=float)
+    for i in cov.index:
+        for j_idx, j in enumerate(cov.columns):
+            denom = var[j_idx]
+            beta.loc[i, j] = (cov.loc[i, j] / denom) if denom != 0 else np.nan
+    return corr, beta, sym_used
+
+
+# ----------------------------------------------------
 # UI — SIDEBAR
 # ----------------------------------------------------
 st.sidebar.header("Backtest Period")
@@ -978,6 +1069,10 @@ end_date = (
 if end_mode.startswith("Rolling"):
     st.sidebar.info(f"Using today's date: {end_date.isoformat()}")
 
+if start_date > end_date:
+    st.sidebar.error("Start date must be on or before end date.")
+    st.stop()
+
 st.sidebar.header("Asset (single-asset panel)")
 asset_key = st.sidebar.selectbox(
     "Choose asset",
@@ -992,10 +1087,14 @@ data_source = st.sidebar.selectbox(
     ["Coinbase", "Kraken", "Yahoo Finance", "Binance (ETH/USDT)", "CoinGecko"],
     index=0,
 )
+
+basic_mode = st.sidebar.checkbox("Use basic mode (hide advanced options)", value=True)
+
 if st.sidebar.button("🔄 Clear data cache"):
     st.cache_data.clear()
-    st.rerun()
+    st.experimental_rerun()
 
+# Core signal logic
 st.sidebar.divider()
 st.sidebar.header("Signal Logic")
 threshold_mode = st.sidebar.selectbox(
@@ -1019,36 +1118,7 @@ window_days = st.sidebar.number_input(
     "Week window (days)", min_value=2, max_value=30, value=DEFAULT_WINDOW_DAYS, step=1
 )
 
-st.sidebar.divider()
-st.sidebar.header("Filters / Risk Controls")
-trend_filter = st.sidebar.selectbox(
-    "Trend filter", ["None", "Close > 200D SMA", "50D SMA > 200D SMA"], index=0
-)
-use_rsi = st.sidebar.checkbox(
-    "Use RSI confirmation (buy only if RSI ≤ threshold)", value=False
-)
-rsi_period = st.sidebar.number_input(
-    "RSI period", min_value=5, max_value=100, value=DEFAULT_RSI_PERIOD, step=1
-)
-rsi_max = st.sidebar.number_input(
-    "RSI threshold (≤)",
-    min_value=5.0,
-    max_value=60.0,
-    value=DEFAULT_RSI_MAX,
-    step=1.0,
-)
-require_new_high_reset = st.sidebar.checkbox(
-    "Require NEW rolling high after a buy before next signal",
-    value=DEFAULT_REQUIRE_NEW_HIGH_RESET,
-)
-max_sig_per_month = st.sidebar.number_input(
-    "Max buys per month (0 = no cap)",
-    min_value=0,
-    max_value=30,
-    value=DEFAULT_MAX_SIG_PER_MONTH,
-    step=1,
-)
-
+# Execution / frictions (basic)
 st.sidebar.divider()
 st.sidebar.header("Execution / Frictions")
 buy_amount = st.sidebar.number_input(
@@ -1068,69 +1138,8 @@ slippage_pct = st.sidebar.number_input(
     value=DEFAULT_SLIPPAGE_PCT,
     step=0.01,
 )
-cooldown_days = st.sidebar.number_input(
-    "Buy cooldown (days)",
-    min_value=0,
-    max_value=30,
-    value=DEFAULT_COOLDOWN_DAYS,
-    step=1,
-)
 
-st.sidebar.divider()
-st.sidebar.header("Take-Profit / Rebalance")
-tp_use = st.sidebar.checkbox("Enable take-profit sells", value=DEFAULT_TP_USE)
-tp_basis = st.sidebar.selectbox("TP basis", ["Average cost", "Last buy price"], index=0)
-tp_trigger_pct = st.sidebar.number_input(
-    "TP trigger (%) above basis",
-    min_value=1.0,
-    max_value=500.0,
-    value=DEFAULT_TP_TRIGGER_PCT,
-    step=1.0,
-)
-tp_sell_pct = st.sidebar.number_input(
-    "TP sell (% of holdings)",
-    min_value=1.0,
-    max_value=100.0,
-    value=DEFAULT_TP_SELL_PCT,
-    step=1.0,
-)
-tp_cooldown_days = st.sidebar.number_input(
-    "TP cooldown (days)",
-    min_value=0,
-    max_value=90,
-    value=DEFAULT_TP_COOLDOWN_DAYS,
-    step=1,
-)
-
-st.sidebar.divider()
-st.sidebar.header("Allocation Caps")
-max_invested_usd = st.sidebar.number_input(
-    "Max total invested USD (0 = no cap)",
-    min_value=0.0,
-    max_value=10_000_000.0,
-    value=DEFAULT_MAX_INVESTED_USD,
-    step=100.0,
-)
-max_position_value_usd = st.sidebar.number_input(
-    "Max position value USD (0 = no cap)",
-    min_value=0.0,
-    max_value=10_000_000.0,
-    value=DEFAULT_MAX_POSITION_VALUE_USD,
-    step=100.0,
-)
-
-st.sidebar.divider()
-st.sidebar.header("Starting Portfolio")
-start_value_usd = st.sidebar.number_input(
-    "Starting value (USD)", min_value=0.0, value=DEFAULT_START_VALUE, step=100.0
-)
-ref_price_usd = st.sidebar.number_input(
-    "Reference price to back into units",
-    min_value=0.01,
-    value=DEFAULT_REF_PRICE,
-    step=0.01,
-)
-
+# Monthly SIP (basic)
 st.sidebar.divider()
 st.sidebar.header("Monthly SIP (multi-asset)")
 monthly_sip_budget = st.sidebar.number_input(
@@ -1143,22 +1152,156 @@ hysa_apy = st.sidebar.number_input(
     "HYSA APY (%)", min_value=0.0, max_value=20.0, value=4.0, step=0.1
 )
 
+# Advanced options
+if not basic_mode:
+    st.sidebar.divider()
+    st.sidebar.header("Filters / Risk Controls")
+    trend_filter = st.sidebar.selectbox(
+        "Trend filter", ["None", "Close > 200D SMA", "50D SMA > 200D SMA"], index=0
+    )
+    use_rsi = st.sidebar.checkbox(
+        "Use RSI confirmation (buy only if RSI ≤ threshold)", value=False
+    )
+    rsi_period = st.sidebar.number_input(
+        "RSI period", min_value=5, max_value=100, value=DEFAULT_RSI_PERIOD, step=1
+    )
+    rsi_max = st.sidebar.number_input(
+        "RSI threshold (≤)",
+        min_value=5.0,
+        max_value=60.0,
+        value=DEFAULT_RSI_MAX,
+        step=1.0,
+    )
+    require_new_high_reset = st.sidebar.checkbox(
+        "Require NEW rolling high after a buy before next signal",
+        value=DEFAULT_REQUIRE_NEW_HIGH_RESET,
+    )
+    max_sig_per_month = st.sidebar.number_input(
+        "Max buys per month (0 = no cap)",
+        min_value=0,
+        max_value=30,
+        value=DEFAULT_MAX_SIG_PER_MONTH,
+        step=1,
+    )
+
+    st.sidebar.divider()
+    st.sidebar.header("Execution / Timing (advanced)")
+    cooldown_days = st.sidebar.number_input(
+        "Buy cooldown (days)",
+        min_value=0,
+        max_value=30,
+        value=DEFAULT_COOLDOWN_DAYS,
+        step=1,
+    )
+
+    st.sidebar.divider()
+    st.sidebar.header("Take-Profit / Rebalance")
+    tp_use = st.sidebar.checkbox("Enable take-profit sells", value=DEFAULT_TP_USE)
+    tp_basis = st.sidebar.selectbox(
+        "TP basis", ["Average cost", "Last buy price"], index=0
+    )
+    tp_trigger_pct = st.sidebar.number_input(
+        "TP trigger (%) above basis",
+        min_value=1.0,
+        max_value=500.0,
+        value=DEFAULT_TP_TRIGGER_PCT,
+        step=1.0,
+    )
+    tp_sell_pct = st.sidebar.number_input(
+        "TP sell (% of holdings)",
+        min_value=1.0,
+        max_value=100.0,
+        value=DEFAULT_TP_SELL_PCT,
+        step=1.0,
+    )
+    tp_cooldown_days = st.sidebar.number_input(
+        "TP cooldown (days)",
+        min_value=0,
+        max_value=90,
+        value=DEFAULT_TP_COOLDOWN_DAYS,
+        step=1,
+    )
+
+    st.sidebar.divider()
+    st.sidebar.header("Allocation Caps")
+    max_invested_usd = st.sidebar.number_input(
+        "Max total invested USD (0 = no cap)",
+        min_value=0.0,
+        max_value=10_000_000.0,
+        value=DEFAULT_MAX_INVESTED_USD,
+        step=100.0,
+    )
+    max_position_value_usd = st.sidebar.number_input(
+        "Max position value USD (0 = no cap)",
+        min_value=0.0,
+        max_value=10_000_000.0,
+        value=DEFAULT_MAX_POSITION_VALUE_USD,
+        step=100.0,
+    )
+
+    st.sidebar.divider()
+    st.sidebar.header("Starting Portfolio")
+    start_value_usd = st.sidebar.number_input(
+        "Starting value (USD)", min_value=0.0, value=DEFAULT_START_VALUE, step=100.0
+    )
+    ref_price_usd = st.sidebar.number_input(
+        "Reference price to back into units",
+        min_value=0.01,
+        value=DEFAULT_REF_PRICE,
+        step=0.01,
+    )
+
+else:
+    # basic defaults
+    trend_filter = "None"
+    use_rsi = False
+    rsi_period = DEFAULT_RSI_PERIOD
+    rsi_max = DEFAULT_RSI_MAX
+    require_new_high_reset = DEFAULT_REQUIRE_NEW_HIGH_RESET
+    max_sig_per_month = DEFAULT_MAX_SIG_PER_MONTH
+    cooldown_days = DEFAULT_COOLDOWN_DAYS
+    tp_use = DEFAULT_TP_USE
+    tp_basis = DEFAULT_TP_BASIS
+    tp_trigger_pct = DEFAULT_TP_TRIGGER_PCT
+    tp_sell_pct = DEFAULT_TP_SELL_PCT
+    tp_cooldown_days = DEFAULT_TP_COOLDOWN_DAYS
+    max_invested_usd = DEFAULT_MAX_INVESTED_USD
+    max_position_value_usd = DEFAULT_MAX_POSITION_VALUE_USD
+    start_value_usd = DEFAULT_START_VALUE
+    ref_price_usd = DEFAULT_REF_PRICE
+
 # ----------------------------------------------------
 # SINGLE-ASSET VIEW
 # ----------------------------------------------------
 st.title(f"📉 {ASSETS[asset_key]['label']} — Buy-the-Dip with Risk Controls")
+st.caption("Tip: adjust settings in the sidebar; data is cached to keep re-runs fast.")
 
 ohlc, used_symbol = fetch_ohlc(start_date, end_date, data_source, asset_key)
 ohlc = _finalize_ohlc(ohlc, start_date, end_date)
+
 st.write(
     f"Using symbol: {used_symbol or asset_key} · rows: {len(ohlc)} · "
     f"first: {ohlc.index.min() if len(ohlc) else None} · last: {ohlc.index.max() if len(ohlc) else None}"
 )
-if len(st.session_state.last_loader_error) and ohlc.empty:
-    st.info("Last loader error: " + st.session_state.last_loader_error)
+
+if not ohlc.empty and (ohlc.index.max() - ohlc.index.min()).days < 60:
+    st.info("Selected window is very short (< 60 days). Results may not be meaningful.")
+
+if not st.session_state.loader_errors:
+    loader_info = "No loader errors in this session."
+else:
+    loader_info = f"{len(st.session_state.loader_errors)} loader issue(s) recorded."
+
+with st.expander("Data loader status / debug"):
+    st.write(loader_info)
+    if st.session_state.loader_errors:
+        st.write("\n".join(st.session_state.loader_errors))
 
 if ohlc.empty:
-    st.error("No price data returned from any source for this asset and date range.")
+    st.error(
+        "No price data returned from any source for this asset and date range.\n\n"
+        "Try expanding the date range or switching the source/symbol."
+    )
     st.stop()
 
 ind = compute_indicators(
@@ -1168,7 +1311,10 @@ ind = compute_indicators(
     atr_period=int(DEFAULT_ATR_PERIOD),
 )
 base_signal = compute_base_signals(
-    ind, threshold_mode=threshold_mode, fixed_pct=float(threshold_pct), atr_mult=float(atr_mult)
+    ind,
+    threshold_mode=threshold_mode,
+    fixed_pct=float(threshold_pct),
+    atr_mult=float(atr_mult),
 )
 
 if ASSETS[asset_key]["kind"] == "crypto":
@@ -1244,28 +1390,21 @@ st.divider()
 
 st.subheader(f"{used_symbol or asset_key} Price with Buys & Sells")
 fig1 = plt.figure()
-plt.plot(details["ind"].index, details["ind"]["Close"].values)
+plt.plot(details["ind"].index, details["ind"]["Close"].values, label="Close")
 trades_df = details["trades_df"]
 if not trades_df.empty:
     buys = trades_df[trades_df["Type"] == "BUY"]
     sells = trades_df[trades_df["Type"] == "SELL"]
     if not buys.empty:
         bp_idx = pd.to_datetime(buys["Date"])
-        plt.scatter(
-            bp_idx,
-            details["ind"]["Close"].loc[bp_idx].values,
-            marker="^",
-        )
+        plt.scatter(bp_idx, details["ind"]["Close"].loc[bp_idx].values, marker="^", label="Buys")
     if not sells.empty:
         sp_idx = pd.to_datetime(sells["Date"])
-        plt.scatter(
-            sp_idx,
-            details["ind"]["Close"].loc[sp_idx].values,
-            marker="v",
-        )
+        plt.scatter(sp_idx, details["ind"]["Close"].loc[sp_idx].values, marker="v", label="Sells")
 plt.title(f"{used_symbol or asset_key} (Close) — Buys (^) and Sells (v)")
 plt.xlabel("Date")
 plt.ylabel("Price (USD)")
+plt.legend()
 st.pyplot(fig1, use_container_width=True)
 
 st.subheader("Average Cost Basis Over Time")
@@ -1320,6 +1459,7 @@ st.divider()
 st.header("🧪 Multi-Asset Dashboard (same parameters)")
 dash_tabs = st.tabs([ASSETS[k]["label"] for k in ASSETS.keys()])
 
+
 def run_strategy_for_asset_key(key: str):
     df, used = fetch_ohlc(start_date, end_date, data_source, key)
     df = _finalize_ohlc(df, start_date, end_date)
@@ -1366,8 +1506,9 @@ def run_strategy_for_asset_key(key: str):
     )
     return used, ii, summ, det
 
-compare_rows = []
-per_asset_results = {}
+
+compare_rows: List[Dict[str, Any]] = {}
+per_asset_results: Dict[str, Tuple[str, pd.DataFrame, Dict[str, Any], Dict[str, Any]]] = {}
 
 for i, key in enumerate(ASSETS.keys()):
     used_sym_ma, ii_ma, summ_ma, det_ma = run_strategy_for_asset_key(key)
@@ -1385,12 +1526,14 @@ for i, key in enumerate(ASSETS.keys()):
             c3.metric("End value", format_usd(summ_ma["terminal_value"]))
             c4.metric(
                 "XIRR",
-                f"{summ_ma['irr_xirr']*100:.2f}%" if pd.notna(summ_ma["irr_xirr"]) else "N/A",
+                f"{summ_ma['irr_xirr']*100:.2f}%"
+                if pd.notna(summ_ma["irr_xirr"])
+                else "N/A",
             )
             st.caption(f"Symbol used: **{used_sym_ma}**")
 
             figd = plt.figure()
-            plt.plot(det_ma["ind"].index, det_ma["ind"]["Close"].values)
+            plt.plot(det_ma["ind"].index, det_ma["ind"]["Close"].values, label="Close")
             trd = det_ma["trades_df"]
             if not trd.empty:
                 bs = trd[trd["Type"] == "BUY"]
@@ -1398,19 +1541,20 @@ for i, key in enumerate(ASSETS.keys()):
                 if not bs.empty:
                     _b = pd.to_datetime(bs["Date"])
                     plt.scatter(
-                        _b, det_ma["ind"]["Close"].loc[_b].values, marker="^"
+                        _b, det_ma["ind"]["Close"].loc[_b].values, marker="^", label="Buys"
                     )
                 if not ss.empty:
                     _s = pd.to_datetime(ss["Date"])
                     plt.scatter(
-                        _s, det_ma["ind"]["Close"].loc[_s].values, marker="v"
+                        _s, det_ma["ind"]["Close"].loc[_s].values, marker="v", label="Sells"
                     )
             plt.title(f"{used_sym_ma} — Close with Buys (^) / Sells (v)")
             plt.xlabel("Date")
             plt.ylabel("Price (USD)")
+            plt.legend()
             st.pyplot(figd, use_container_width=True)
 
-            compare_rows.append(
+            compare_rows.setdefault("rows", []).append(
                 {
                     "AssetKey": key,
                     "UsedSymbol": used_sym_ma,
@@ -1431,7 +1575,7 @@ for i, key in enumerate(ASSETS.keys()):
             )
 
 if compare_rows:
-    cmp_df = pd.DataFrame(compare_rows).set_index("AssetKey")
+    cmp_df = pd.DataFrame(compare_rows["rows"]).set_index("AssetKey")
     st.subheader("Multi-Asset Comparison (same parameters)")
     st.dataframe(cmp_df, use_container_width=True)
     st.download_button(
@@ -1454,7 +1598,7 @@ if monthly_sip_budget > 0:
     base_slice = monthly_sip_budget / float(len(ASSETS)) if len(ASSETS) > 0 else 0.0
 
     # First pass: for each asset, compute indicators & SIP-eligible signals and month-level best dip
-    sip_asset_info = {}
+    sip_asset_info: Dict[str, Dict[str, Any]] = {}
     for key in ASSETS.keys():
         df_sip, used_sym_sip = fetch_ohlc(start_date, end_date, data_source, key)
         df_sip = _finalize_ohlc(df_sip, start_date, end_date)
@@ -1476,7 +1620,7 @@ if monthly_sip_budget > 0:
             rsi_max=float(rsi_max),
         )
         # Build month_signals: pick the day with max drawdown in each month where eligible is True
-        month_signals = {}
+        month_signals: Dict[Tuple[int, int], Dict[str, Any]] = {}
         for (y, m) in months_list:
             mask = (ind_sip.index.year == y) & (ind_sip.index.month == m)
             month_df = ind_sip.loc[mask]
@@ -1497,17 +1641,19 @@ if monthly_sip_budget > 0:
         }
 
     # Second pass: allocate monthly SIP across assets based on dip depth
-    allocations = {k: {} for k in ASSETS.keys()}  # allocations[asset][(y,m)] = amount
-    hysa_contrib_rows = []
+    allocations: Dict[str, Dict[Tuple[int, int], float]] = {
+        k: {} for k in ASSETS.keys()
+    }  # allocations[asset][(y,m)] = amount
+    hysa_contrib_rows: List[Dict[str, Any]] = []
     hysa_balance = 0.0
-    hysa_cf_dates = []
-    hysa_cf_amounts = []
+    hysa_cf_dates: List[date] = []
+    hysa_cf_amounts: List[float] = []
     monthly_rate = (hysa_apy / 100.0) / 12.0 if hysa_apy > 0 else 0.0
 
     for (y, m) in months_list:
         # collect assets with a signal in this month
-        active_assets = []
-        weights = []
+        active_assets: List[str] = []
+        weights: List[float] = []
         for key, info in sip_asset_info.items():
             ms = info["month_signals"]
             if (y, m) in ms:
@@ -1566,7 +1712,7 @@ if monthly_sip_budget > 0:
         hysa_cf_amounts.append(hysa_balance)
 
     hysa_irr = (
-        robust_xirr(pd.to_datetime(hysa_cf_dates), hysa_cf_amounts)
+        robust_xirr(hysa_cf_dates, hysa_cf_amounts)
         if hysa_cf_dates
         else np.nan
     )
@@ -1576,7 +1722,7 @@ if monthly_sip_budget > 0:
     )
 
     # Third pass: run SIP buy-hold simulation per asset using month-level allocations
-    sip_rows = []
+    sip_rows: List[Dict[str, Any]] = []
     for key, info in sip_asset_info.items():
         ind_sip = info["ind"]
         month_signals = info["month_signals"]
@@ -1596,7 +1742,7 @@ if monthly_sip_budget > 0:
                 }
             )
             continue
-        summ_sip, det_sip = simulate_sip_buy_hold(
+        summ_sip, _ = simulate_sip_buy_hold(
             ind_sip,
             month_signals=month_signals,
             month_allocs=month_allocs,
@@ -1674,39 +1820,8 @@ st.divider()
 # ----------------------------------------------------
 st.header("📈 Correlation & Beta (1y / 3y / 5y)")
 
-def load_close_series_for_all(end_dt: date, years: int):
-    start_dt = end_dt - timedelta(days=365 * years + 14)
-    frames = {}
-    symbols_used = {}
-    for key in ASSETS.keys():
-        df, used = fetch_ohlc(start_dt, end_dt, data_source, key)
-        df = _finalize_ohlc(df, start_dt, end_dt)
-        if df is None or df.empty:
-            continue
-        frames[key] = df["Close"].rename(key)
-        symbols_used[key] = used
-    if not frames:
-        return pd.DataFrame(), {}
-    allc = pd.concat(frames.values(), axis=1).dropna(how="any")
-    return allc, symbols_used
-
-def corr_beta_tables(end_dt: date, years: int):
-    closes, sym_used = load_close_series_for_all(end_dt, years)
-    if closes.empty or len(closes) < 30:
-        return None, None, sym_used
-    rets = closes.pct_change().dropna(how="any")
-    corr = rets.corr()
-    cov = rets.cov()
-    var = np.diag(cov.values)
-    beta = pd.DataFrame(index=cov.index, columns=cov.columns, dtype=float)
-    for i in cov.index:
-        for j_idx, j in enumerate(cov.columns):
-            denom = var[j_idx]
-            beta.loc[i, j] = (cov.loc[i, j] / denom) if denom != 0 else np.nan
-    return corr, beta, sym_used
-
 for years in [1, 3, 5]:
-    corr, beta, used_map = corr_beta_tables(end_date, years)
+    corr, beta, used_map = corr_beta_tables(end_date, years, data_source)
     st.subheader(f"Time Horizon: {years} year{'s' if years>1 else ''}")
     if corr is None:
         st.info("Not enough overlapping data to compute metrics for this horizon.")
@@ -1741,22 +1856,45 @@ for years in [1, 3, 5]:
             )
 
 st.divider()
-st.markdown(
-    """
+with st.expander("Methodology & Controls (detailed)"):
+    st.markdown(
+        """
 **Methodology & Controls**
-- Dip buy: first cross where drawdown vs rolling window high ≥ threshold (fixed % or ATR×mult).
-- Filters: Trend (SMA), RSI, new-high reset, cooldown, monthly cap.
-- Execution: Slippage & fees on buys/sells. Average-cost basis tracked daily.
-- Take-profit: when price ≥ basis × (1 + TP%), sell % with cooldown.
-- Caps: skip if total invested or position value would exceed caps.
-- Data:
-  - ETH-USD: Coinbase -> Kraken -> Binance -> Yahoo Finance fallback.
-  - GLD / ^SOX / ARTY: Yahoo Finance on multiple tickers -> Stooq (.us) CSV fallback.
-- Multi-asset SIP (weighted by dip depth):
-  - Each month: base slice = SIP/4 per asset.
-  - Assets that meet dip+filter criteria form the eligible set; total invested that month = base_slice × #eligible.
-  - That pool is split across eligible assets proportional to their drawdown on the chosen signal day (deeper dips ⇒ bigger weight).
+
+- **Dip buy**  
+  Buy on the first day where drawdown vs rolling window high ≥ threshold  
+  (either a fixed % or ATR×multiple).
+
+- **Filters**  
+  - Trend: optional SMA filters (Close > 200D, or 50D > 200D).  
+  - RSI: optional “RSI ≤ threshold” confirmation.  
+  - New-high reset: optionally require a new rolling high after a buy before the next signal.  
+  - Cooldown & monthly cap: control over-trading.
+
+- **Execution**  
+  - Slippage & fees applied to both buys and sells.  
+  - Average-cost basis tracked daily.  
+
+- **Take-profit / Rebalance**  
+  - When price ≥ basis × (1 + TP%), sell a configurable % of holdings, with cooldown.
+
+- **Risk Caps**  
+  - Skip trades if total invested or position value would exceed user-defined caps.
+
+- **Data**  
+  - ETH-USD: Coinbase → Kraken → Binance → Yahoo Finance fallback.  
+  - GLD / ^SOX / ARTY: Yahoo Finance on multiple tickers → Stooq (.us) CSV fallback.
+
+- **Multi-asset SIP (weighted by dip depth)**  
+  - Each month: base slice = SIP / 4 per asset.  
+  - Assets that meet dip + filter criteria form the eligible set.  
+  - Total invested that month = base_slice × #eligible.  
+  - That pool is split across eligible assets proportional to their drawdown on the chosen signal day  
+    (deeper dips ⇒ bigger weight).  
   - The unused portion of the SIP (if any) goes to HYSA, which compounds monthly at the chosen APY.
-- Correlation/Beta: daily pct-change returns; βᵢ⟂ⱼ = Cov(i,j)/Var(j) (row vs column).
+
+- **Correlation/Beta**  
+  - Daily pct-change returns.  
+  - βᵢ⟂ⱼ = Cov(i,j)/Var(j) (row vs column).
 """
-)
+    )
